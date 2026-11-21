@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sua Clínica</title>
+<meta name="robots" content="noindex">
+<link rel="icon" type="image/svg+xml" href="/assets/logo-icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+
+<div id="login">
+  <form class="lbox" onsubmit="return doLogin(event)">
+    <div class="logo"><span class="lg"></span><span>Sua <b>Clínica</b></span></div>
+    <p class="sub">Entre para acessar a agenda da sua clínica</p>
+    <label for="l_e">E-mail</label><input type="text" id="l_e" autocomplete="username" inputmode="email" required>
+    <label for="l_p">Senha</label><input type="password" id="l_p" autocomplete="current-password" required>
+    <button class="btn pri" id="l_b" type="submit">Entrar</button>
+    <div class="err" id="l_err"></div>
+  </form>
+</div>
+
+<div id="fatal"><div class="lbox">
+  <div class="logo"><span class="lg"></span><span>Sua <b>Clínica</b></span></div>
+  <p class="sub" id="fatal_msg"></p>
+  <button class="btn pri" onclick="doLogout()">Sair</button>
+</div></div>
+
+<div id="app" class="hide">
+  <aside>
+    <div class="logo"><span class="lg"></span><span>Sua <b>Clínica</b></span></div>
+    <button class="nav" data-p="agenda"><span>📅</span>Agenda</button>
+    <button class="nav" data-p="hoje"><span>🩺</span>Atendimento</button>
+    <button class="nav" data-p="clientes"><span>👥</span>Clientes</button>
+    <button class="nav" data-p="whatsapp"><span>💬</span>WhatsApp</button>
+    <button class="nav" data-p="equipe"><span>⚙️</span>Equipe e Cadastros</button>
+    <div class="plan" id="planbox"></div>
+  </aside>
+  <main>
+    <div class="top"><h1 id="ttl"></h1><div class="who" onclick="openMe()" title="Minha conta"><span id="clin"></span><small id="role"></small></div></div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<div class="ov" id="ov"><div class="md-box" id="mb"></div></div>
+<div id="toast"></div>
+<script src="/js/app.js"></script>
+</body>
+</html>
