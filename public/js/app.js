@@ -479,16 +479,112 @@ const q_ = v => '"' + safeCell(v).replace(/"/g, '""') + '"';
 function tplCsv() { dl('modelo-clientes.csv', 'Nome;Telefone;Observações\nMaria Silva;(82) 99111-2233;Pele sensível\nCarla Mendes;82 99222-3344;'); }
 function exportCsv() { dl('clientes-sua-clinica.csv', 'Nome;Telefone;Observações\n' + S.clients.map(c => [c.name, c.phone, c.notes].map(q_).join(';')).join('\n')); toast('Lista de clientes exportada'); }
 function formImport() {
-  modal(`<h2>Importar clientes</h2><p class="kv">Exporte a lista do sistema antigo (ou de uma planilha) em CSV e envie aqui. No Excel ou Google Planilhas: Arquivo › Salvar como / Baixar › CSV.</p>
-  <div class="acts" style="margin-top:8px"><label class="btn pri" style="margin:0;cursor:pointer">📁 Escolher arquivo CSV<input type="file" accept=".csv,.txt,text/csv" hidden onchange="readImp(this)"></label><button class="btn" onclick="tplCsv()">⬇ Baixar modelo</button></div>
+  modal(`<h2>Importar clientes</h2><p class="kv">Exporte a lista de clientes do sistema antigo (ou de uma planilha) em Excel (.xlsx) ou CSV e envie aqui.</p>
+  <div class="acts" style="margin-top:8px"><label class="btn pri" style="margin:0;cursor:pointer">📁 Escolher arquivo (Excel ou CSV)<input type="file" accept=".xlsx,.csv,.txt,text/csv" hidden onchange="readImp(this)"></label><button class="btn" onclick="tplCsv()">⬇ Baixar modelo</button></div>
   <label>ou cole os dados aqui (com a linha de títulos)</label><textarea id="i_t" rows="5" placeholder="Nome;Telefone;Observações"></textarea>
   <div class="acts"><button class="btn" onclick="prevImp($('#i_t').value)">Continuar</button><button class="btn" onclick="closeM()">Cancelar</button></div>`, true);
 }
 function readText(inp, cb) { const f = inp.files[0]; if (!f) return; f.arrayBuffer().then(b => { let t; try { t = new TextDecoder('utf-8', { fatal: true }).decode(b); } catch (e) { t = new TextDecoder('windows-1252').decode(b); } cb(t); }); }
-function readImp(inp) { readText(inp, prevImp); }
-function prevImp(text) {
-  const rows = csvParse(text || ''); if (rows.length < 2) return toast('Arquivo vazio ou sem linhas de clientes');
-  const h = rows[0].map(x => x.trim()); const g = re => h.findIndex(x => re.test(x));
+function readImp(inp) { readTable(inp, prevImp); }
+
+/* ---------- leitura de planilhas (.xlsx e .csv), sem bibliotecas externas ---------- */
+async function inflateRaw(bytes) {
+  const ds = new DecompressionStream('deflate-raw');
+  return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer());
+}
+function unzip(buf) {
+  const u8 = new Uint8Array(buf), dv = new DataView(buf);
+  let e = u8.length - 22; const minE = Math.max(0, u8.length - 65557);
+  while (e >= minE && dv.getUint32(e, true) !== 0x06054b50) e--;
+  if (e < minE) throw new Error('zip');
+  const n = dv.getUint16(e + 10, true); let p = dv.getUint32(e + 16, true);
+  const files = {};
+  for (let i = 0; i < n; i++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const nl = dv.getUint16(p + 28, true), el = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+    files[new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nl))] = { method: dv.getUint16(p + 10, true), csize: dv.getUint32(p + 20, true), lo: dv.getUint32(p + 42, true) };
+    p += 46 + nl + el + cl;
+  }
+  return {
+    async get(name) {
+      const f = files[name]; if (!f) return null;
+      const start = f.lo + 30 + dv.getUint16(f.lo + 26, true) + dv.getUint16(f.lo + 28, true);
+      const data = u8.subarray(start, start + f.csize);
+      return new TextDecoder().decode(f.method === 0 ? data : await inflateRaw(data));
+    }
+  };
+}
+async function xlsxRows(buf) {
+  const zp = unzip(buf);
+  const xml = async n => { const t = await zp.get(n); return t ? new DOMParser().parseFromString(t, 'application/xml') : null; };
+  let sheetPath = 'xl/worksheets/sheet1.xml';
+  const wb = await xml('xl/workbook.xml'), rels = await xml('xl/_rels/workbook.xml.rels');
+  if (wb && rels) {
+    const sh = wb.getElementsByTagName('sheet')[0];
+    const rid = sh && (sh.getAttribute('r:id') || sh.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id'));
+    const rel = [...rels.getElementsByTagName('Relationship')].find(r => r.getAttribute('Id') === rid);
+    if (rel) { const t = rel.getAttribute('Target'); sheetPath = t.startsWith('/') ? t.slice(1) : 'xl/' + t; }
+  }
+  const ss = [], sst = await xml('xl/sharedStrings.xml');
+  if (sst) for (const si of sst.getElementsByTagName('si')) {
+    let t = ''; for (const x of si.getElementsByTagName('t')) if (x.parentNode.nodeName !== 'rPh') t += x.textContent; ss.push(t);
+  }
+  const dateXf = [], st = await xml('xl/styles.xml');
+  if (st) {
+    const custom = {}; for (const nf of st.getElementsByTagName('numFmt')) custom[nf.getAttribute('numFmtId')] = nf.getAttribute('formatCode') || '';
+    const xfs = st.getElementsByTagName('cellXfs')[0];
+    if (xfs) [...xfs.getElementsByTagName('xf')].forEach((x, i) => {
+      const id = +x.getAttribute('numFmtId'), code = custom[id];
+      dateXf[i] = (id >= 14 && id <= 22) || (id >= 45 && id <= 47) || (!!code && /[dmyhs]/i.test(code.replace(/"[^"]*"|\[[^\]]*\]|\\./g, '')));
+    });
+  }
+  const sx = await xml(sheetPath); if (!sx) throw new Error('aba');
+  const colIdx = ref => { let n = 0; for (const ch of ref.replace(/\d/g, '')) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+  const rows = [];
+  for (const row of sx.getElementsByTagName('row')) {
+    const arr = [];
+    for (const c of row.getElementsByTagName('c')) {
+      const ref = c.getAttribute('r'), t = c.getAttribute('t'), sIdx = +c.getAttribute('s');
+      const vEl = c.getElementsByTagName('v')[0], v = vEl ? vEl.textContent : '';
+      let val = '';
+      if (t === 's') val = ss[+v] || '';
+      else if (t === 'inlineStr') val = [...c.getElementsByTagName('t')].map(x => x.textContent).join('');
+      else if (t === 'b') val = v === '1' ? 'Sim' : 'Não';
+      else if (t === 'str' || t === 'e' || t === 'd') val = v;
+      else if (v !== '') {
+        if (dateXf[sIdx] && isFinite(parseFloat(v))) {
+          const sec = Math.round(parseFloat(v) * 86400), d = new Date(Date.UTC(1899, 11, 30) + sec * 1000);
+          val = d.getUTCFullYear() + '-' + z(d.getUTCMonth() + 1) + '-' + z(d.getUTCDate()) + (((sec % 86400) + 86400) % 86400 ? ' ' + z(d.getUTCHours()) + ':' + z(d.getUTCMinutes()) + ':' + z(d.getUTCSeconds()) : '');
+        } else val = v;
+      }
+      arr[ref ? colIdx(ref) : arr.length] = val.trim();
+    }
+    const full = Array.from(arr, x => x == null ? '' : x);
+    if (full.some(x => x !== '')) rows.push(full);
+  }
+  return rows;
+}
+// Lê .xlsx ou .csv e entrega uma lista de linhas (cada linha, uma lista de textos)
+function readTable(inp, cb) {
+  const f = inp.files[0]; if (!f) return;
+  f.arrayBuffer().then(async b => {
+    const h = new Uint8Array(b.slice(0, 4));
+    try {
+      if (h[0] === 0x50 && h[1] === 0x4b) cb(await xlsxRows(b));
+      else if (h[0] === 0xD0 && h[1] === 0xCF) toast('Este é um Excel antigo (.xls). Abra no Excel e salve como .xlsx ou CSV.');
+      else { let t; try { t = new TextDecoder('utf-8', { fatal: true }).decode(b); } catch (e) { t = new TextDecoder('windows-1252').decode(b); } cb(csvParse(t)); }
+    } catch (e) { toast('Não consegui ler esse arquivo. Salve como .xlsx ou CSV e tente de novo.'); }
+    inp.value = '';
+  });
+}
+// Ignora títulos e linhas soltas acima do cabeçalho (o Gestek coloca um cabeçalho do relatório no topo)
+function fromHeader(rows, isHeader) { const i = rows.findIndex(isHeader); return i > 0 ? rows.slice(i) : rows; }
+
+function prevImp(input) {
+  let rows = Array.isArray(input) ? input : csvParse(input || '');
+  rows = fromHeader(rows, r => r.some(c => /^(nome|cliente|paciente)\b/.test(normS(c))) && r.some(c => /tel|fone|whats|celular|contato/.test(normS(c))));
+  if (rows.length < 2) return toast('Arquivo vazio ou sem linhas de clientes');
+  const h = rows[0].map(x => String(x).trim()); const g = re => h.findIndex(x => re.test(x));
   imp = { h, rows: rows.slice(1), n: g(/nome|name|cliente|paciente/i), t: g(/tel|fone|whats|celular|contato/i), o: g(/obs|anota|nota/i) };
   showImp();
 }
@@ -528,45 +624,63 @@ function parseDate(s) {
   else if (m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/)) { let y = +m[3]; if (y < 100) y += 2000; r = y + '-' + z(+m[2]) + '-' + z(+m[1]); }
   if (!r) return null; const d = new Date(r + 'T12:00'); return isNaN(d) || iso(d) !== r ? null : r;
 }
-function parseTime(s) { const m = String(s || '').trim().toLowerCase().match(/^(\d{1,2})\s*[:h]\s*(\d{2})?/); if (!m) return null; const h = +m[1], mi = +(m[2] || 0); return h > 23 || mi > 59 ? null : z(h) + ':' + z(mi); }
+function parseTime(s) { s = String(s || '').trim().toLowerCase(); const dt = s.match(/^\d{4}-\d{2}-\d{2}[ t](\d{1,2}):(\d{2})/) || s.match(/^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}[ t]+(\d{1,2}):(\d{2})/); if (dt) { const h = +dt[1], mi = +dt[2]; return h > 23 || mi > 59 ? null : z(h) + ':' + z(mi); } const m = s.match(/^(\d{1,2})\s*[:h]\s*(\d{2})?/); if (!m) return null; const h = +m[1], mi = +(m[2] || 0); return h > 23 || mi > 59 ? null : z(h) + ':' + z(mi); }
 function tplIA() { const d = addD(TODAY, 1).split('-').reverse().join('/'); dl('modelo-agenda.csv', `Data;Hora;Cliente;Telefone;Profissional;Procedimento;Duração (min)\n${d};09:00;Maria Silva;(82) 99111-2233;${(activePros()[0] || { name: 'Dra. Fernanda' }).name};Limpeza de pele;60\n${d};10:30;Carla Mendes;(82) 99222-3344;${(activePros()[1] || activePros()[0] || { name: 'Dra. Camila' }).name};Peeling;40`); }
 function formImportAppt() {
-  modal(`<h2>Importar agendamentos futuros</h2><p class="kv">Exporte a agenda do sistema antigo em CSV. Entram só os agendamentos de hoje em diante, dentro do horário da agenda (08:00–19:00). Clientes que ainda não existem são cadastrados automaticamente.</p>
-  <div class="acts" style="margin-top:8px"><label class="btn pri" style="margin:0;cursor:pointer">📁 Escolher arquivo CSV<input type="file" accept=".csv,.txt,text/csv" hidden onchange="readText(this,prevIA)"></label><button class="btn" onclick="tplIA()">⬇ Baixar modelo</button></div>
+  modal(`<h2>Importar agendamentos futuros</h2><p class="kv">Exporte a agenda do sistema antigo (por exemplo, o relatório de agendamentos do Gestek) em Excel (.xlsx) ou CSV. Entram só os agendamentos de hoje em diante, dentro do horário da agenda (08:00–19:00). Clientes que ainda não existem são cadastrados automaticamente.</p>
+  <div class="acts" style="margin-top:8px"><label class="btn pri" style="margin:0;cursor:pointer">📁 Escolher arquivo (Excel ou CSV)<input type="file" accept=".xlsx,.csv,.txt,text/csv" hidden onchange="readTable(this,prevIA)"></label><button class="btn" onclick="tplIA()">⬇ Baixar modelo</button></div>
   <label>ou cole os dados aqui (com a linha de títulos)</label><textarea id="ia_t" rows="5" placeholder="Data;Hora;Cliente;Telefone;Profissional;Procedimento"></textarea>
   <div class="acts"><button class="btn" onclick="prevIA($('#ia_t').value)">Continuar</button><button class="btn" onclick="closeM()">Cancelar</button></div>`, true);
 }
-function prevIA(text) {
-  const rows = csvParse(text || ''); if (rows.length < 2) return toast('Arquivo vazio ou sem agendamentos');
-  const h = rows[0].map(x => x.trim()); const g = re => h.findIndex(x => re.test(normS(x)));
-  ia = { h, rows: rows.slice(1), proMap: {}, procMap: {}, col: { d: g(/^data|^dia$/), t: g(/hora|horario/), n: g(/nome|cliente|paciente/), f: g(/tel|fone|whats|celular|contato/), p: g(/profission|atendente|especialista/), x: g(/procedim|servico|tratamento/), u: g(/dura|minut/) } };
+function prevIA(input) {
+  let rows = Array.isArray(input) ? input : csvParse(input || '');
+  rows = fromHeader(rows, r => r.some(c => /^(nome|cliente|paciente)\b/.test(normS(c))) && r.some(c => /^(data|dia|inicio)\b/.test(normS(c))));
+  if (rows.length < 2) return toast('Arquivo vazio ou sem agendamentos');
+  const h = rows[0].map(x => String(x).trim());
+  const gi = (re, not) => h.findIndex(x => { const n = normS(x); return re.test(n) && !(not && not.test(n)); });
+  const first = (...i) => i.find(x => x >= 0) ?? -1;
+  ia = { h, rows: rows.slice(1), proMap: {}, procMap: {}, col: {
+    d: first(gi(/inicio/), gi(/^data$|^dia$/), gi(/^data/, /fim|cria/)),
+    t: gi(/^hora|horario/, /fim|cria/),
+    n: gi(/^(nome|cliente|paciente)/),
+    f: gi(/tel|fone|whats|celular|contato/),
+    p: gi(/profission|atendente|especialista/),
+    x: gi(/procedim|servico|tratamento/),
+    u: gi(/dura|minut/),
+    e: gi(/fim|termino/, /cria/),
+    s: gi(/^status|situacao/)
+  } };
   showIA();
 }
 function showIA() {
   const c = ia.col, at = (r, k) => c[k] >= 0 ? String(r[c[k]] || '').trim() : '';
-  const bad = { data: 0, hora: 0, nome: 0, fora: 0, passado: 0 }; ia.items = [];
+  const bad = { data: 0, hora: 0, nome: 0, fora: 0, passado: 0, cancel: 0 }; ia.items = [];
   ia.rows.forEach(r => {
-    const date = parseDate(at(r, 'd')), time = parseTime(at(r, 't')), name = at(r, 'n');
+    const dv = at(r, 'd'), date = parseDate(dv), time = c.t >= 0 ? parseTime(at(r, 't')) : parseTime(dv), name = at(r, 'n');
+    if (c.s >= 0 && /cancel|falt|desmarc|nao compar/.test(normS(at(r, 's')))) { bad.cancel++; return; }
     if (!date) { bad.data++; return; } if (!time) { bad.hora++; return; } if (!name) { bad.nome++; return; }
     if (date < TODAY) { bad.passado++; return; }
     const m = tm(time); if (m < START || m >= END) { bad.fora++; return; }
-    ia.items.push({ date, time, name, phone: at(r, 'f'), pro: at(r, 'p'), proc: at(r, 'x'), dur: parseInt(at(r, 'u')) || 0 });
+    let dur = parseInt(at(r, 'u')) || 0;
+    if (!dur && c.e >= 0) { const ev = at(r, 'e'), et = parseTime(ev); if (et && parseDate(ev) === date) { const df = tm(et) - m; if (df >= 5 && df <= 480) dur = df; } }
+    ia.items.push({ date, time, name, phone: at(r, 'f'), pro: at(r, 'p'), proc: at(r, 'x'), dur });
   });
   ia.pk = [...new Set(ia.items.map(i => i.pro))]; ia.xk = [...new Set(ia.items.map(i => i.proc))];
   const aps = activePros();
   ia.pk.forEach(n => { if (!(n in ia.proMap)) { const p = aps.find(p => likeName(p.name, n)); ia.proMap[n] = p ? p.id : (!n && aps.length === 1 ? aps[0].id : ''); } });
-  ia.xk.forEach(n => { if (!(n in ia.procMap)) { const p = activeProcs().find(p => likeName(p.name, n)); ia.procMap[n] = p ? p.id : (n ? 'new' : (activeProcs()[0] || {}).id); } });
-  const colSel = (k, lab, none) => `<div><label>${lab}</label><select onchange="ia.col.${k}=+this.value;showIA()"><option value="-1">${none ? '— não tenho —' : 'Selecione…'}</option>${ia.h.map((x, i) => `<option value="${i}" ${i === c[k] ? 'selected' : ''}>${esc(x || 'Coluna ' + (i + 1))}</option>`).join('')}</select></div>`;
+  ia.xk.forEach(n => { if (!(n in ia.procMap)) { const p = n ? activeProcs().find(p => normS(p.name) === normS(n)) : null; ia.procMap[n] = p ? p.id : 'new'; } });
+  const colSel = (k, lab, none) => `<div><label>${lab}</label><select onchange="ia.col.${k}=+this.value;showIA()"><option value="-1">${none ? (typeof none === 'string' ? none : '— não tenho —') : 'Selecione…'}</option>${ia.h.map((x, i) => `<option value="${i}" ${i === c[k] ? 'selected' : ''}>${esc(x || 'Coluna ' + (i + 1))}</option>`).join('')}</select></div>`;
   const valid = ia.items.filter(i => ia.proMap[i.pro]); const semPro = ia.items.length - valid.length;
   const newCli = new Set(valid.filter(i => !S.clients.some(cl => normS(cl.name) === normS(i.name) || (digits(i.phone).length >= 8 && digits(cl.phone).slice(-9) === digits(i.phone).slice(-9)))).map(i => normS(i.name))).size;
   modal(`<h2>Importar agendamentos futuros</h2><p class="kv">1. Confira as colunas</p>
-  <div class="row">${colSel('d', 'Data')}${colSel('t', 'Hora')}${colSel('n', 'Cliente')}${colSel('f', 'Telefone', 1)}</div>
-  <div class="row">${colSel('p', 'Profissional', 1)}${colSel('x', 'Procedimento', 1)}${colSel('u', 'Duração (min)', 1)}</div>
+  <div class="row">${colSel('d', 'Data (e hora, se juntas)')}${colSel('t', 'Hora', '— mesma da Data —')}${colSel('n', 'Cliente')}${colSel('f', 'Telefone', 1)}</div>
+  <div class="row">${colSel('p', 'Profissional', 1)}${colSel('x', 'Procedimento', 1)}${colSel('u', 'Duração (min)', 1)}${colSel('e', 'Fim (para calcular a duração)', 1)}</div>
+  <div class="row">${colSel('s', 'Status (ignora cancelados)', 1)}<div></div><div></div><div></div></div>
   <p class="kv" style="margin-top:16px">2. Ligue os nomes da planilha aos cadastros do sistema</p>
   ${ia.pk.map((n, i) => `<div class="pl-row" style="padding:8px 0"><div style="flex:1">Profissional: <b>${esc(n || '(sem profissional na planilha)')}</b></div><select style="width:230px" onchange="ia.proMap[ia.pk[${i}]]=this.value;showIA()"><option value="">Ignorar estes agendamentos</option>${aps.map(p => `<option value="${p.id}" ${ia.proMap[n] === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>`).join('')}
-  ${ia.xk.map((n, i) => `<div class="pl-row" style="padding:8px 0"><div style="flex:1">Procedimento: <b>${esc(n || '(sem procedimento na planilha)')}</b></div><select style="width:230px" onchange="ia.procMap[ia.xk[${i}]]=this.value;showIA()">${n ? `<option value="new" ${ia.procMap[n] === 'new' ? 'selected' : ''}>Criar novo procedimento</option>` : ''}${activeProcs().map(p => `<option value="${p.id}" ${ia.procMap[n] === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>`).join('')}
+  ${ia.xk.map((n, i) => `<div class="pl-row" style="padding:8px 0"><div style="flex:1">Procedimento: <b>${esc(n || '(sem procedimento na planilha)')}</b></div><select style="width:230px" onchange="ia.procMap[ia.xk[${i}]]=this.value;showIA()"><option value="new" ${ia.procMap[n] === 'new' ? 'selected' : ''}>${n ? 'Criar novo procedimento' : 'Criar “Procedimento não informado”'}</option>${activeProcs().map(p => `<option value="${p.id}" ${ia.procMap[n] === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>`).join('')}
   <div style="margin:16px 0"><span class="tag s-concluido">${valid.length} agendamentos para importar</span> <span class="tag s-atendimento">${newCli} clientes novos</span></div>
-  <p class="kv">Ignorados: ${semPro} sem profissional definida · ${bad.passado} em datas passadas · ${bad.fora} fora do horário da agenda · ${bad.data + bad.hora + bad.nome} com data, hora ou nome inválido</p>
+  <p class="kv">Ignorados: ${semPro} sem profissional definida · ${bad.passado} em datas passadas · ${bad.fora} fora do horário da agenda · ${bad.cancel} cancelados ou faltas · ${bad.data + bad.hora + bad.nome} com data, hora ou nome inválido</p>
   <p class="kv">Horários sobrepostos entram como encaixe, lado a lado.</p>
   <div class="acts"><button class="btn pri" id="ia_b" ${valid.length ? '' : 'disabled'} onclick="doIA()">Importar ${valid.length} agendamentos</button><button class="btn" onclick="formImportAppt()">Voltar</button></div>`, true);
 }
@@ -574,7 +688,7 @@ async function doIA() {
   const b = $('#ia_b'); b.disabled = true;
   const items = ia.items.filter(i => ia.proMap[i.pro]).map(i => {
     const m = ia.procMap[i.proc], known = m && m !== 'new' ? prc(m) : null;
-    return { date: i.date, time: i.time, dur: i.dur || (known && known.dur) || 30, professionalId: ia.proMap[i.pro], procedureId: known ? known.id : null, procedureName: known ? known.name : i.proc, clientName: i.name, phone: i.phone ? fmtPhone(i.phone) : '' };
+    return { date: i.date, time: i.time, dur: i.dur || (known && known.dur) || 30, professionalId: ia.proMap[i.pro], procedureId: known ? known.id : null, procedureName: known ? known.name : (i.proc || 'Procedimento não informado'), clientName: i.name, phone: i.phone ? fmtPhone(i.phone) : '' };
   });
   const r = await run(() => api('POST', '/api/appointments/bulk', { items }));
   if (!r) { b.disabled = false; return; }
