@@ -14,6 +14,7 @@ const { digits } = require('../util');
 const DRIVER = (process.env.WA_DRIVER || '').toLowerCase();
 const DATA_DIR = process.env.WA_DATA_DIR || path.join(process.cwd(), '.wwebjs');
 const MAX_SESSIONS = Number(process.env.WA_MAX_SESSIONS) || 5;
+const AUTH_TIMEOUT = Number(process.env.WA_AUTH_TIMEOUT_MS) || 180000;   // servidores pequenos demoram para abrir o WhatsApp Web
 const MIN_GAP = Number(process.env.WA_MIN_GAP_MS ?? 4000);
 const MAX_GAP = Number(process.env.WA_MAX_GAP_MS ?? 9000);
 
@@ -70,10 +71,13 @@ async function connect(clinicId) {
   const { Client, LocalAuth } = lib;
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: 'clinica-' + clinicId, dataPath: DATA_DIR }),
+    authTimeoutMs: AUTH_TIMEOUT,
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote', '--disable-extensions']
+      protocolTimeout: 240000,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote', '--disable-extensions',
+        '--disable-background-networking', '--disable-default-apps', '--disable-sync', '--disable-translate', '--mute-audio', '--no-first-run', '--disable-software-rasterizer']
     }
   });
   s.client = client;
@@ -100,7 +104,12 @@ async function connect(clinicId) {
   client.on('message', (msg) => { onIncoming(clinicId, msg).catch(e => console.error('WhatsApp (resposta):', e.message)); });
 
   client.initialize().catch(async (e) => {
-    s.status = 'error'; s.error = 'Não foi possível iniciar o WhatsApp: ' + e.message;
+    const m = String((e && e.message) || e);
+    console.error('WhatsApp (iniciar):', m);
+    s.status = 'error';
+    s.error = /timeout|exceeded|waiting failed/i.test(m)
+      ? 'O WhatsApp Web demorou demais para abrir no servidor. Tente de novo; se continuar, o servidor está com pouca memória ou processador.'
+      : 'Não foi possível iniciar o WhatsApp: ' + m;
     try { await client.destroy(); } catch (_) {}
     s.client = null;
   });
