@@ -2,11 +2,15 @@
 // Roda contra um Postgres de teste: DATABASE_URL=postgres://... npm test
 process.env.JWT_SECRET = 'teste';
 process.env.SETUP_KEY = 'chave-de-teste';
+process.env.WA_DRIVER = 'fake';          // WhatsApp de mentira (não abre navegador)
+process.env.WA_MIN_GAP_MS = '0'; process.env.WA_MAX_GAP_MS = '0';
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { migrate, pool, q } = require('../src/db');
 const { createApp } = require('../src/app');
 const { createClinic } = require('../src/services/clinics');
+const wa = require('../src/services/whatsapp');
+const waitFor = async (fn, ms = 3000) => { const t = Date.now(); for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t > ms) return v; await new Promise(r => setTimeout(r, 25)); } };
 
 let server, base;
 const jar = {};   // cookie por "usuário"
@@ -182,8 +186,11 @@ test('importações em lote', async () => {
 test('edição/remarcação e cancelamento', async () => {
   const a = await call('adminA', 'POST', '/api/appointments', { clientId: client1, procedureId: proc1, professionalId: pro2, date: DAY, time: '11:00', dur: 30 });
   await call('adminA', 'POST', `/api/appointments/${a.data.id}/status`, { status: 'confirmado' });
-  await call('adminA', 'POST', '/api/messages', { kind: 'Confirmação', name: 'Maria', to: '82991112233', text: 'oi', appointmentId: a.data.id });
-  let cur = (await call('adminA', 'GET', `/api/appointments?from=${DAY}&to=${DAY}`)).data.appts.find(x => x.id === a.data.id);
+  assert.equal((await call('adminA', 'POST', '/api/whatsapp/connect')).status, 200); wa.fakeScan(A.clinicId);
+  assert.equal((await call('adminA', 'POST', '/api/messages', { kind: 'Confirmação', name: 'Maria', to: '82991112233', text: 'oi', appointmentId: a.data.id })).status, 202);
+  const getCur = async () => (await call('adminA', 'GET', `/api/appointments?from=${DAY}&to=${DAY}`)).data.appts.find(x => x.id === a.data.id);
+  assert.ok(await waitFor(async () => (await getCur()).wa));
+  const cur = await getCur();
   assert.equal(cur.wa, true); assert.equal(cur.status, 'confirmado');
   const mv = await call('adminA', 'PATCH', `/api/appointments/${a.data.id}`, { time: '11:30' });   // remarcar → volta a "agendado" e pede nova confirmação
   assert.equal(mv.status, 200); assert.equal(mv.data.time, '11:30'); assert.equal(mv.data.status, 'agendado'); assert.equal(mv.data.wa, false);
@@ -210,4 +217,126 @@ test('clínica cancelada perde o acesso', async () => {
   assert.equal((await login('b2', 'bia@b.com')).status, 402);
   await q(`UPDATE clinics SET status='past_due' WHERE id=$1`, [B.clinicId]);
   assert.equal((await call('adminB', 'GET', '/api/bootstrap')).status, 200);
+});
+
+
+test('WhatsApp: conexão por QR, fila de envio, resposta 1/2 e isolamento entre clínicas', async () => {
+  await call('adminA', 'POST', '/api/whatsapp/disconnect');
+  let st = (await call('adminA', 'GET', '/api/whatsapp/status')).data;
+  assert.equal(st.mode, 'real'); assert.equal(st.status, 'disconnected');
+  const msg = (extra = {}) => call('adminA', 'POST', '/api/messages', { kind: 'Confirmação', name: 'Maria', to: '82991112233', text: 'oi', ...extra });
+  const r0 = await msg(); assert.equal(r0.status, 409); assert.equal(r0.data.code, 'wa_disconnected');
+
+  st = (await call('adminA', 'POST', '/api/whatsapp/connect')).data;
+  assert.equal(st.status, 'qr'); assert.ok(st.qr);
+  assert.equal((await call('adminB', 'GET', '/api/whatsapp/status')).data.status, 'disconnected');   // outra clínica não é afetada
+  assert.equal(wa.fakeScan(A.clinicId), true);
+  assert.equal((await call('adminA', 'GET', '/api/whatsapp/status')).data.status, 'connected');
+
+  assert.equal((await msg({ to: 'abc' })).status, 400);                                // telefone inválido
+  const cl = (await call('adminA', 'POST', '/api/clients', { name: 'Joana Teste', phone: '(82) 99888-7766' })).data;
+  const ap = (await call('adminA', 'POST', '/api/appointments', { clientId: cl.id, procedureId: proc1, professionalId: pro1, date: '2030-06-03', time: '09:00', dur: 30 })).data;
+  const sent = await msg({ to: cl.phone, name: cl.name, appointmentId: ap.id });
+  assert.equal(sent.status, 202);
+  const log = async () => (await call('adminA', 'GET', '/api/whatsapp/status')).data.log.find(l => l.id === sent.data.id);
+  assert.equal((await waitFor(async () => (await log()).status === 'enviado')), true);
+  const list = (await call('adminA', 'GET', '/api/appointments?from=2030-06-03&to=2030-06-03')).data.appts;
+  assert.equal(list.find(x => x.id === ap.id).wa, true);
+
+  const bad = await msg({ to: '(82) 90000-0000', name: 'Sem Zap' });                       // número sem WhatsApp → falha registrada
+  assert.equal(bad.status, 202);
+  assert.ok(await waitFor(async () => { const l = (await call('adminA', 'GET', '/api/whatsapp/status')).data.log.find(x => x.id === bad.data.id); return l.status === 'falhou' && /WhatsApp/.test(l.detail); }));
+
+  // cliente responde 2 e depois 1
+  const said = []; const reply = t => said.push(t);
+  await wa.handleReply(A.clinicId, '5582998887766', '2', reply);
+  assert.match(said[0], /remarcar/);
+  let cur = (await call('adminA', 'GET', '/api/appointments?from=2030-06-03&to=2030-06-03')).data.appts.find(x => x.id === ap.id);
+  assert.equal(cur.status, 'agendado');
+  await wa.handleReply(A.clinicId, '5582998887766', '1', reply);
+  assert.match(said[1], /Confirmado/);
+  cur = (await call('adminA', 'GET', '/api/appointments?from=2030-06-03&to=2030-06-03')).data.appts.find(x => x.id === ap.id);
+  assert.equal(cur.status, 'confirmado');
+  await wa.handleReply(A.clinicId, '5582900000001', '1', reply);                       // número desconhecido é ignorado
+  assert.equal(said.length, 2);
+
+  // profissional não mexe no WhatsApp
+  assert.equal((await login('pro', 'fer@a.com')).status, 200);
+  assert.equal((await call('pro', 'GET', '/api/whatsapp/status')).status, 403);
+  assert.equal((await call('pro', 'POST', '/api/whatsapp/connect')).status, 403);
+
+  await call('adminA', 'POST', '/api/whatsapp/disconnect');
+  assert.equal((await msg()).status, 409);
+});
+
+test('vendas: pagamento, etiqueta de paga, pacote com sessões e indicadores do mês', async () => {
+  assert.equal((await login('pro', 'fer@a.com')).status, 200);
+  const cl = (await call('adminA', 'POST', '/api/clients', { name: 'Paula Pacote', phone: '(82) 98111-0000' })).data;
+  const mkAp = (time, extra = {}) => call('adminA', 'POST', '/api/appointments', { clientId: cl.id, procedureId: proc1, professionalId: pro1, date: '2030-07-10', time, dur: 30, ...extra });
+  const av = (await mkAp('10:00')).data;
+  const pay = (v) => ({ method: 'pix', amount: v });
+  const sale = (extra = {}) => call('adminA', 'POST', '/api/sales', { clientId: cl.id, appointmentId: av.id, kind: 'package', name: 'Pacote Laser 6 sessões', sessions: 3, total: 1200,
+    validUntil: '2030-12-31', payments: [{ method: 'pix', amount: 200 }, { method: 'credito', amount: 1000, installments: 4 }], ...extra });
+
+  // validações
+  assert.equal((await sale({ payments: [pay(100)] })).status, 400);                         // soma diferente do total
+  assert.equal((await sale({ payments: [{ method: 'credito', amount: 1200, installments: 25 }] })).status, 400);
+  assert.equal((await sale({ payments: [{ method: 'cheque', amount: 1200 }] })).status, 400);
+  assert.equal((await sale({ total: 0 })).status, 400);
+  assert.equal((await sale({ sessions: 0 })).status, 400);
+  assert.equal((await call('adminB', 'POST', '/api/sales', { clientId: cl.id, kind: 'procedure', name: 'X', total: 10, payments: [pay(10)] })).status, 400); // cliente de outra clínica
+
+  const ok = await sale();
+  assert.equal(ok.status, 201);
+  assert.equal(ok.data.total, 1200); assert.equal(ok.data.payments.length, 2); assert.equal(ok.data.payments[1].installments, 4);
+  assert.equal(ok.data.used, 0);
+  let appts = (await call('adminA', 'GET', '/api/appointments?from=2030-07-10&to=2030-07-10')).data.appts;
+  assert.equal(appts.find(x => x.id === av.id).paid, true);                                 // etiqueta "Paga"
+  assert.equal((await sale()).status, 409);                                                // não paga duas vezes o mesmo agendamento
+
+  // pacote de 3 sessões
+  const s1 = await mkAp('11:00', { saleId: ok.data.id }), s2 = await mkAp('12:00', { saleId: ok.data.id }), s3 = await mkAp('13:00', { saleId: ok.data.id });
+  assert.equal([s1, s2, s3].every(x => x.status === 201), true);
+  const full = await mkAp('14:00', { saleId: ok.data.id });
+  assert.equal(full.status, 409); assert.equal(full.data.code, 'pkg_full');
+  const late = await call('adminA', 'POST', '/api/appointments', { clientId: cl.id, procedureId: proc1, professionalId: pro1, date: '2031-02-01', time: '10:00', dur: 30, saleId: ok.data.id });
+  assert.equal(late.status, 409);                                                          // depois da validade (e pacote cheio: qualquer um dos dois bloqueia)
+  // cancelar uma sessão devolve a vaga
+  assert.equal((await call('adminA', 'POST', `/api/appointments/${s3.data.id}/status`, { status: 'cancelado' })).status, 200);
+  assert.equal((await mkAp('14:00', { saleId: ok.data.id })).status, 201);
+  // sessão de outro cliente não usa pacote alheio
+  const outro = (await call('adminA', 'POST', '/api/clients', { name: 'Outra Pessoa', phone: '(82) 97000-1111' })).data;
+  assert.equal((await call('adminA', 'POST', '/api/appointments', { clientId: outro.id, procedureId: proc1, professionalId: pro1, date: '2030-07-11', time: '10:00', dur: 30, saleId: ok.data.id })).status, 400);
+
+  // ficha do cliente: sessões
+  const fich = (await call('adminA', 'GET', `/api/sales?clientId=${cl.id}`)).data.sales[0];
+  assert.equal(fich.sessions, 3); assert.equal(fich.scheduled, 3); assert.equal(fich.used, 0);
+
+  // segunda venda avulsa, em outro cliente, para os indicadores
+  const av2 = (await call('adminA', 'POST', '/api/appointments', { clientId: outro.id, procedureId: proc1, professionalId: pro1, date: '2030-07-12', time: '10:00', dur: 30 })).data;
+  const v2 = await call('adminA', 'POST', '/api/sales', { clientId: outro.id, appointmentId: av2.id, kind: 'procedure', name: 'Pacote Laser 6 sessões', total: 300.5, payments: [{ method: 'debito', amount: 300.5 }] });
+  assert.equal(v2.status, 201);
+  const v3 = await call('adminA', 'POST', '/api/sales', { clientId: outro.id, kind: 'procedure', name: 'Limpeza de pele', total: 99.5, payments: [{ method: 'dinheiro', amount: 99.5 }] });
+  assert.equal(v3.status, 201);
+
+  const month = new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 7);
+  const st = (await call('adminA', 'GET', `/api/sales/stats?month=${month}`)).data;
+  assert.equal(st.count, 3); assert.equal(st.revenue, 1600);
+  assert.equal(Math.round(st.ticket * 100) / 100, 533.33);
+  assert.equal(st.top[0].name, 'Pacote Laser 6 sessões'); assert.equal(st.top[0].qty, 2);
+  assert.equal(st.top[1].name, 'Limpeza de pele');
+  const pix = st.methods.find(m => m.method === 'pix'); assert.equal(pix.amount, 200);
+
+  // profissional não vê vendas; só admin cancela
+  assert.equal((await call('pro', 'GET', '/api/sales/stats')).status, 403);
+  assert.equal((await call('pro', 'POST', '/api/sales', { clientId: cl.id, kind: 'procedure', name: 'X', total: 10, payments: [pay(10)] })).status, 403);
+  assert.equal((await call('adminA', 'PATCH', `/api/sales/${v3.data.id}`, { status: 'cancelada' })).status, 200);
+  const st2 = (await call('adminA', 'GET', `/api/sales/stats?month=${month}`)).data;
+  assert.equal(st2.count, 2); assert.equal(st2.revenue, 1500.5);
+  // cancelar a venda tira a etiqueta
+  assert.equal((await call('adminA', 'PATCH', `/api/sales/${v2.data.id}`, { status: 'cancelada' })).status, 200);
+  appts = (await call('adminA', 'GET', '/api/appointments?from=2030-07-12&to=2030-07-12')).data.appts;
+  assert.equal(appts.find(x => x.id === av2.id).paid, false);
+  // vendas de uma clínica não aparecem na outra
+  assert.equal((await call('adminB', 'GET', `/api/sales/stats?month=${month}`)).data.count, 0);
 });

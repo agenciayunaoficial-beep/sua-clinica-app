@@ -42,8 +42,8 @@ r.post('/', wrap(async (req, res) => {
   }
   try {
     const row = (await q(
-      `INSERT INTO users (clinic_id,name,email,password_hash,role,color) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.user.clinicId, name, email, await hash(req.body.password), role, color])).rows[0];
+      `INSERT INTO users (clinic_id,name,email,password_hash,role,color,phone) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.user.clinicId, name, email, await hash(req.body.password), role, color, str(req.body.phone, 40)])).rows[0];
     res.status(201).json(S.member(row));
   } catch (e) {
     if (e.code === '23505') throw conflict('Já existe um usuário com esse e-mail');
@@ -58,6 +58,7 @@ r.patch('/:id', wrap(async (req, res) => {
   if (cur.role === 'admin' && cur.id !== req.user.id && String(cur.id) !== req.user.id) throw bad('Não é possível alterar a administradora');
   const b = req.body, f = {};
   if (b.name !== undefined) { f.name = str(b.name, 120); if (!f.name) throw bad('Informe o nome'); }
+  if (b.phone !== undefined) f.phone = str(b.phone, 40);
   if (b.color !== undefined) { if (!isColor(b.color)) throw bad('Cor inválida'); f.color = b.color; }
   if (b.email !== undefined) { f.email = normEmail(b.email); if (!isEmail(f.email)) throw bad('E-mail inválido'); }
   if (b.active !== undefined) {

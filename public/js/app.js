@@ -73,15 +73,15 @@ function saveSim(v) { try { localStorage.setItem('sc_wa_sim', v ? '1' : '0'); } 
 async function boot() {
   try {
     const d = await api('GET', '/api/bootstrap');
-    S = d; S.wa = { connected: loadSim(), tpl: d.templates };
+    S = d; S.wa = { ...d.wa, demoOn: loadSim(), tpl: d.templates }; S.pkgs = d.pkgs || [];
     ui.hojePro = S.me.role === 'professional' ? S.me.id : (activePros()[0] || {}).id || null;
     $('#login').classList.remove('on'); $('#app').classList.remove('hide');
     $('#clin').textContent = S.clinic.name; $('#role').textContent = S.me.name + ' · ' + ROLE[S.me.role];
     document.querySelectorAll('.nav').forEach(b => {
       const p = b.dataset.p;
-      b.classList.toggle('hide', (p === 'whatsapp' && !isStaff()) || (p === 'equipe' && !isStaff()));
+      b.classList.toggle('hide', (['whatsapp', 'equipe', 'vendas'].includes(p) && !isStaff()));
     });
-    if (!isStaff() && (ui.page === 'whatsapp' || ui.page === 'equipe')) ui.page = 'agenda';
+    if (!isStaff() && ['whatsapp', 'equipe', 'vendas'].includes(ui.page)) ui.page = 'agenda';
     render();
   } catch (e) { if (e.status !== 401 && e.status !== 402) { showLogin(); $('#l_err').textContent = e.message; } }
 }
@@ -89,8 +89,8 @@ document.querySelectorAll('.nav').forEach(b => b.onclick = () => go(b.dataset.p)
 function go(p) { ui.page = p; render(); }
 async function reload() {
   const d = await api('GET', `/api/bootstrap?from=${S.window.from}&to=${S.window.to}`);
-  Object.assign(S, { clinic: d.clinic, pros: d.pros, procs: d.procs, clients: d.clients, appts: d.appts, blocks: d.blocks, log: d.log, window: d.window });
-  S.wa.tpl = d.templates;
+  Object.assign(S, { clinic: d.clinic, pros: d.pros, procs: d.procs, clients: d.clients, appts: d.appts, blocks: d.blocks, log: d.log, window: d.window, pkgs: d.pkgs || [] });
+  Object.assign(S.wa, d.wa); S.wa.tpl = d.templates;
 }
 async function ensureRange(d) {
   const lo = addD(S.window.from, 25), hi = addD(S.window.to, -25);
@@ -105,14 +105,14 @@ setInterval(async () => {
   try { await reload(); render(); } catch (e) {}
 }, 30000);
 
-const TITLES = { agenda: 'Agenda', hoje: 'Atendimento do dia', clientes: 'Clientes', whatsapp: 'WhatsApp', equipe: 'Equipe e Cadastros' };
+const TITLES = { agenda: 'Agenda', hoje: 'Atendimento do dia', clientes: 'Clientes', vendas: 'Vendas e desempenho', whatsapp: 'WhatsApp', equipe: 'Equipe e Cadastros' };
 function render() {
   if (!S) return;
   document.querySelectorAll('.nav').forEach(b => b.classList.toggle('on', b.dataset.p === ui.page));
   $('#ttl').textContent = TITLES[ui.page];
   const price = S.clinic.plan === 'annual' ? 'R$ 899,90/ano' : 'R$ 99,90/mês';
   $('#planbox').innerHTML = `<b>Plano ${esc(S.clinic.planLabel)}</b><br>${price}<br>${S.clinic.plan === 'annual' ? 'Até 5 usuários' : '2 profissionais + recepcionista'}`;
-  ({ agenda: pgAgenda, hoje: pgHoje, clientes: pgClientes, whatsapp: pgWa, equipe: pgEquipe })[ui.page]();
+  ({ agenda: pgAgenda, hoje: pgHoje, clientes: pgClientes, vendas: pgVendas, whatsapp: pgWa, equipe: pgEquipe })[ui.page]();
 }
 const warnHtml = () => S.clinic.status === 'past_due' ? '<div class="warn">⚠️ Há um pagamento pendente na assinatura. Regularize para não perder o acesso.</div>' : '';
 
@@ -179,7 +179,7 @@ function dayGrid() {
     const items = lanes(S.appts.filter(a => a.date === ui.date && a.pro === p.id && a.status !== 'cancelado').map(a => ({ a, s: tm(a.time), e: tm(a.time) + a.dur })));
     const aps = items.map(({ a, s, e, lane, n }) => {
       const top = (s - START) / STEP * RH, h = (e - s) / STEP * RH - 2;
-      return `<div class="ap s-${a.status}" style="top:${top}px;height:${h}px;left:calc(${lane}*100%/${n} + 3px);width:calc(100%/${n} - 6px)" onclick="event.stopPropagation();showAppt('${a.id}')" title="${esc(cli(a.client).name)}"><b>${a.time} ${esc(cli(a.client).name)}</b><span>${esc(prc(a.proc).name)}${a.wa ? ' · 💬' : ''}</span></div>`;
+      return `<div class="ap s-${a.status}" style="top:${top}px;height:${h}px;left:calc(${lane}*100%/${n} + 3px);width:calc(100%/${n} - 6px)" onclick="event.stopPropagation();showAppt('${a.id}')" title="${esc(cli(a.client).name)}"><b>${a.time} ${esc(cli(a.client).name)}</b><span>${esc(prc(a.proc).name)}${a.wa ? ' · 💬' : ''}${a.paid ? ' · 💰' : ''}${a.saleId ? ' · 📦' : ''}</span></div>`;
     }).join('');
     const bl = S.blocks.filter(b => b.date === ui.date && b.pro === p.id).map(b => {
       const s = Math.max(tm(b.start), START), e = Math.min(tm(b.end), END);
@@ -215,17 +215,24 @@ function monthGrid() {
 
 /* ---------- agendamento ---------- */
 function timeOpts(sel) { let o = ''; for (let m = START; m < END; m += STEP) o += `<option ${mt(m) === sel ? 'selected' : ''}>${mt(m)}</option>`; return o; }
+function pkgSelect(clientId, date, sel) {
+  if (!clientId || clientId === 'new' || !S.pkgs) return '';
+  const l = S.pkgs.filter(p => p.client === clientId && (p.id === sel || (pkgLeft(p) > 0 && (!p.validUntil || !date || date <= p.validUntil))));
+  if (!l.length) return '';
+  return `<label>Sessão de pacote</label><select id="f_pk"><option value="">Não usar pacote (atendimento avulso)</option>${l.map(p => `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>📦 ${esc(p.name)} · ${p.used + p.scheduled} de ${p.sessions} usadas/agendadas</option>`).join('')}</select>`;
+}
 function formAppt(id, pre) {
   if (!activePros().length) return toast('Cadastre uma profissional em Equipe e Cadastros primeiro');
   const a = id ? apt(id) : Object.assign({ date: ui.date, time: '08:00', dur: (activeProcs()[0] || {}).dur || 30, pro: activePros()[0].id, client: '', proc: (activeProcs()[0] || {}).id }, pre || {});
   if (!id && pre && pre.client === undefined) a.client = '';
   if (!id && pre && !pre.dur && pre.pro) a.dur = prc(a.proc).dur;
   modal(`<h2>${id ? 'Editar' : 'Novo'} agendamento</h2>
-  <label>Cliente</label><select id="f_c" onchange="$('#f_nc').style.display=this.value==='new'?'block':'none'"><option value="">Selecione…</option>${S.clients.map(c => `<option value="${c.id}" ${c.id === a.client ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}<option value="new">+ Cadastrar novo cliente</option></select>
+  <label>Cliente</label><select id="f_c" onchange="$('#f_nc').style.display=this.value==='new'?'block':'none';$('#f_pkw').innerHTML=pkgSelect(this.value,$('#f_dt').value)"><option value="">Selecione…</option>${S.clients.map(c => `<option value="${c.id}" ${c.id === a.client ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}<option value="new">+ Cadastrar novo cliente</option></select>
   <div id="f_nc" style="display:none"><div class="row"><div><label>Nome</label><input type="text" id="f_n"></div><div><label>WhatsApp</label><input type="tel" id="f_t" placeholder="(82) 90000-0000"></div></div></div>
+  <div id="f_pkw">${pkgSelect(a.client, a.date, a.saleId)}</div>
   <label>Procedimento</label><select id="f_p" onchange="$('#f_d').value=prc(this.value).dur">${activeProcs().map(p => `<option value="${p.id}" ${p.id === a.proc ? 'selected' : ''}>${esc(p.name)} (${p.dur} min)</option>`).join('')}</select>
   <label>Profissional</label><select id="f_pr">${activePros().map(p => `<option value="${p.id}" ${p.id === a.pro ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
-  <div class="row"><div><label>Data</label><input type="date" id="f_dt" value="${a.date}"></div><div><label>Horário</label><select id="f_h">${timeOpts(a.time)}</select></div><div><label>Duração (min)</label><input type="text" id="f_d" value="${a.dur}"></div></div>
+  <div class="row"><div><label>Data</label><input type="date" id="f_dt" value="${a.date}" onchange="if($('#f_pk')){const c=$('#f_c').value;$('#f_pkw').innerHTML=pkgSelect(c,this.value,$('#f_pk').value)}"></div><div><label>Horário</label><select id="f_h">${timeOpts(a.time)}</select></div><div><label>Duração (min)</label><input type="text" id="f_d" value="${a.dur}"></div></div>
   <div class="acts"><button class="btn pri" id="f_save" onclick="saveAppt('${id || ''}')">Salvar</button><button class="btn" onclick="closeM()">Cancelar</button></div>`);
 }
 async function saveAppt(id) {
@@ -239,7 +246,7 @@ async function saveAppt(id) {
       S.clients.push(nc); S.clients.sort((a, b) => a.name.localeCompare(b.name)); c = nc.id;
     }
     if (!c) { toast('Selecione o cliente'); btn.disabled = false; return; }
-    const body = { clientId: c, procedureId: $('#f_p').value, professionalId: $('#f_pr').value, date: $('#f_dt').value, time: $('#f_h').value, dur: parseInt($('#f_d').value) || 30 };
+    const body = { clientId: c, procedureId: $('#f_p').value, professionalId: $('#f_pr').value, date: $('#f_dt').value, time: $('#f_h').value, dur: parseInt($('#f_d').value) || 30, saleId: $('#f_pk') ? $('#f_pk').value : (id ? undefined : '') };
     const send = ov => id ? api('PATCH', '/api/appointments/' + id, { ...body, allowOverlap: ov }) : api('POST', '/api/appointments', { ...body, allowOverlap: ov });
     let r;
     try { r = await send(false); }
@@ -262,11 +269,17 @@ function showAppt(id) {
     concluido: '', cancelado: ''
   }[a.status];
   const ev = a.status === 'concluido' ? `<div style="margin-top:14px"><h3>Comprovante da baixa</h3><div id="proof" class="kv">Carregando…</div></div>` : '';
-  modal(`<h2>${esc(c.name)}</h2><span class="tag s-${a.status}">${STAT[a.status]}</span>
+  const pk = a.saleId ? (S.pkgs || []).find(p => p.id === a.saleId) : null;
+  const canPay = isStaff() && a.status !== 'cancelado' && !a.paid;
+  const payBtns = isStaff() ? (canPay ? `<button class="btn grn" onclick="formSale('${a.client}','${id}')">💰 Lançar venda / pagamento</button>` : '')
+    + (!a.saleId && (a.status === 'agendado' || a.status === 'confirmado') && (S.pkgs || []).some(p => p.client === a.client && pkgLeft(p) > 0) ? `<button class="btn" onclick="usePkg('${id}')">📦 Usar pacote</button>` : '')
+    + (a.saleId && (a.status === 'agendado' || a.status === 'confirmado') ? `<button class="btn" onclick="saveUsePkg('${id}','')">Desvincular do pacote</button>` : '') : '';
+  modal(`<h2 class="lnk" onclick="fichaCli('${a.client}')" title="Abrir ficha do cliente">${esc(c.name)}</h2><span class="tag s-${a.status}">${STAT[a.status]}</span>${a.paid ? ' <span class="tag s-concluido">💰 Paga</span>' : ''}${a.saleId ? ' <span class="tag s-confirmado">📦 Pacote</span>' : ''}
   <p class="kv">📞 ${esc(c.phone)}</p><p class="kv">✨ ${esc(x.name)} · ${a.dur} min · ${brl(x.price)}</p>
   <p class="kv">👩‍⚕️ ${esc(p.name)}</p><p class="kv">🗓 ${longD(a.date)} · ${a.time} – ${mt(tm(a.time) + a.dur)}</p>
-  ${c.notes ? `<p class="kv">📝 ${esc(c.notes)}</p>` : ''}${a.wa ? '<p class="kv">💬 Confirmação registrada no WhatsApp</p>' : ''}${ev}
-  <div class="acts">${btn}${isStaff() && (a.status === 'agendado' || a.status === 'confirmado') ? `<button class="btn" onclick="formAppt('${id}')">Editar / remarcar</button><button class="btn red" onclick="if(confirm('Cancelar este agendamento?'))setSt('${id}','cancelado')">Cancelar</button>` : ''}<button class="btn" onclick="closeM()">Fechar</button></div>`);
+  ${pk ? `<p class="kv">📦 ${esc(pk.name)} · ${pk.used + pk.scheduled} de ${pk.sessions} sessões usadas/agendadas</p>` : (a.saleId ? '<p class="kv">📦 Faz parte de um pacote</p>' : '')}
+  ${c.notes ? `<p class="kv">📝 ${esc(c.notes)}</p>` : ''}${a.wa ? '<p class="kv">💬 Confirmação enviada pelo WhatsApp</p>' : ''}${ev}
+  <div class="acts">${btn}${payBtns}${isStaff() && (a.status === 'agendado' || a.status === 'confirmado') ? `<button class="btn" onclick="formAppt('${id}')">Editar / remarcar</button><button class="btn red" onclick="if(confirm('Cancelar este agendamento?'))setSt('${id}','cancelado')">Cancelar</button>` : ''}<button class="btn" onclick="closeM()">Fechar</button></div>`);
   if (a.status === 'concluido') loadProof(id);
 }
 async function loadProof(id) {
@@ -359,52 +372,116 @@ async function delBlock(id) {
   S.blocks = S.blocks.filter(x => x.id !== id); closeM(); render(); toast('Bloqueio removido');
 }
 
-/* ---------- WhatsApp (envio ainda simulado: registra a mensagem, não envia) ---------- */
+/* ---------- WhatsApp (conexão real por QR Code; sem a biblioteca no servidor, cai no modo demonstração) ---------- */
+const waDemo = () => S.wa.mode === 'demo';
+const waOn = () => waDemo() ? S.wa.demoOn : S.wa.status === 'connected';
 function fill(t, a, extra) {
   const c = cli(a.client), p = pro(a.pro);
   return t.replace(/{nome}/g, c.name.split(' ')[0]).replace(/{procedimento}/g, prc(a.proc).name).replace(/{data}/g, shortD(a.date)).replace(/{hora}/g, a.time).replace(/{profissional}/g, p.name).replace(/{clinica}/g, S.clinic.name).replace(/{lista}/g, extra || '');
 }
-async function logWa(to, name, text, kind, apptId) { const m = await api('POST', '/api/messages', { kind, name, to, text, appointmentId: apptId }); S.log.unshift(m); }
+async function logWa(to, name, text, kind, apptId) { const m = await api('POST', '/api/messages', { kind, name, to, text, appointmentId: apptId }); S.log = [m, ...S.log.filter(x => x.id !== m.id)]; return m; }
+function needWa() { toast(waDemo() ? 'Ative o modo de demonstração primeiro' : 'Conecte o WhatsApp primeiro (leia o QR Code)'); go('whatsapp'); }
 async function sendConf(id) {
-  if (!S.wa.connected) { closeM(); toast('Conecte o WhatsApp primeiro'); return go('whatsapp'); }
+  if (!waOn()) { closeM(); return needWa(); }
   const a = apt(id), c = cli(a.client);
-  const r = await run(async () => { await logWa(c.phone, c.name, fill(S.wa.tpl.conf, a), 'Confirmação', id); return true; });
-  if (!r) return;
-  a.wa = true; closeM(); render(); toast('Confirmação registrada para ' + c.name.split(' ')[0] + ' (o envio real pelo WhatsApp chega na próxima etapa)');
+  const m = await run(() => logWa(c.phone, c.name, fill(S.wa.tpl.conf, a), 'Confirmação', id));
+  if (!m) return;
+  if (waDemo()) a.wa = true;
+  closeM(); render();
+  toast(waDemo() ? 'Confirmação registrada (modo demonstração)' : 'Confirmação na fila de envio para ' + c.name.split(' ')[0]);
 }
 async function sendAgenda(pid) {
-  if (!S.wa.connected) { toast('Conecte o WhatsApp primeiro'); return go('whatsapp'); }
+  if (!waOn()) return needWa();
   const p = pro(pid), l = S.appts.filter(a => a.date === TODAY && a.pro === pid && a.status !== 'cancelado').sort((a, b) => a.time < b.time ? -1 : 1);
   if (!l.length) return toast('Sem pacientes hoje para ' + p.name);
+  if (!waDemo() && digits(p.phone).length < 8) return toast('Cadastre o WhatsApp de ' + p.name + ' em Equipe e Cadastros');
   const lista = l.map(a => `• ${a.time} – ${cli(a.client).name} (${prc(a.proc).name})`).join('\n');
-  const r = await run(async () => { await logWa('(profissional)', p.name, S.wa.tpl.agenda.replace(/{profissional}/g, p.name).replace(/{data}/g, shortD(TODAY)).replace(/{lista}/g, lista), 'Agenda da profissional'); return true; });
-  if (r) toast('Agenda do dia registrada para ' + p.name + ' (envio real na próxima etapa)');
+  const text = S.wa.tpl.agenda.replace(/{profissional}/g, p.name).replace(/{data}/g, shortD(TODAY)).replace(/{lista}/g, lista);
+  const r = await run(() => logWa(p.phone || '(profissional)', p.name, text, 'Agenda da profissional'));
+  if (r) toast(waDemo() ? 'Agenda do dia registrada para ' + p.name : 'Agenda do dia na fila de envio para ' + p.name);
 }
-async function sendAllConf() {
-  if (!S.wa.connected) return toast('Conecte o WhatsApp primeiro');
-  const l = S.appts.filter(a => a.status === 'agendado' && !a.wa && a.date >= TODAY);
-  if (!l.length) return toast('Nenhuma confirmação pendente');
-  const r = await run(async () => { for (const a of l) { await logWa(cli(a.client).phone, cli(a.client).name, fill(S.wa.tpl.conf, a), 'Confirmação', a.id); a.wa = true; } return true; });
-  render(); if (r) toast(l.length + ' confirmações registradas');
+async function sendBatch(list, kind, tpl, label) {
+  if (!waOn()) return needWa();
+  if (!list.length) return toast('Nenhum ' + label + ' pendente');
+  let ok = 0, skip = 0;
+  const r = await run(async () => {
+    for (const a of list) {
+      const c = cli(a.client);
+      if (digits(c.phone).length < 8) { skip++; continue; }
+      await logWa(c.phone, c.name, fill(tpl, a), kind, a.id); ok++;
+      if (waDemo() && kind === 'Confirmação') a.wa = true;
+    }
+    return true;
+  });
+  render();
+  if (r || ok) toast(ok + ' ' + label + (ok === 1 ? '' : 's') + (waDemo() ? ' registrado(s)' : ' na fila de envio') + (skip ? ` · ${skip} sem telefone válido` : ''));
 }
+const sendAllConf = () => sendBatch(S.appts.filter(a => a.status === 'agendado' && !a.wa && a.date >= TODAY), 'Confirmação', S.wa.tpl.conf, 'confirmação');
+const sendAllLemb = () => sendBatch(S.appts.filter(a => (a.status === 'agendado' || a.status === 'confirmado') && a.date === addD(TODAY, 1)), 'Lembrete', S.wa.tpl.lemb, 'lembrete');
 async function saveTpl() {
   const r = await run(() => api('PUT', '/api/settings/wa-templates', S.wa.tpl));
   if (r) toast('Mensagem salva');
 }
+async function connectWa() {
+  const r = await run(() => api('POST', '/api/whatsapp/connect'));
+  if (r) { Object.assign(S.wa, r); paintWa(); }
+}
+async function disconnectWa() {
+  if (!confirm('Desconectar o WhatsApp da clínica? Mensagens na fila serão canceladas e será preciso ler o QR Code de novo.')) return;
+  const r = await run(() => api('POST', '/api/whatsapp/disconnect'));
+  if (r) { Object.assign(S.wa, r); paintWa(); toast('WhatsApp desconectado'); }
+}
+function fmtNum(n) { const d = digits(n); return d.length >= 12 ? `+${d.slice(0, 2)} ${d.slice(2, 4)} ${d.slice(4, -4)}-${d.slice(-4)}` : (n ? '+' + d : ''); }
+function waActions() {
+  return `<div class="acts" style="margin-top:14px"><button class="btn pri" onclick="sendAllConf()">💬 Enviar confirmações pendentes</button><button class="btn" onclick="sendAllLemb()">⏰ Lembretes de amanhã</button></div>`;
+}
+function connHtml() {
+  const w = S.wa;
+  if (waDemo()) {
+    return `<h3>Conexão do WhatsApp</h3>${w.demoOn
+      ? `<p><span class="tag s-concluido">● Demonstração ativa</span></p><p class="kv">As mensagens são só registradas. A conexão real não está disponível neste servidor.</p>${waActions()}<div class="acts"><button class="btn red" onclick="S.wa.demoOn=false;saveSim(false);render()">Desligar demonstração</button></div>`
+      : `<p><span class="tag s-cancelado" style="text-decoration:none">● Desconectado</span></p><p class="kv">A conexão real por QR Code não está disponível neste servidor.</p><button class="btn pri" onclick="S.wa.demoOn=true;saveSim(true);render();toast('Modo de demonstração ativado')">Ativar modo de demonstração</button>`}`;
+  }
+  const q = w.queued ? `<p class="kv">📤 ${w.queued} mensagem(ns) na fila de envio</p>` : '';
+  if (w.status === 'connected') return `<h3>Conexão do WhatsApp</h3><p><span class="tag s-concluido">● Conectado</span> <b>${esc(fmtNum(w.number))}</b></p><p class="kv">As mensagens saem do número da clínica, com uma pequena pausa entre uma e outra para proteger o número.</p>${q}${waActions()}<div class="acts"><button class="btn red" onclick="disconnectWa()">Desconectar</button></div>`;
+  if (w.status === 'qr') return `<h3>Conexão do WhatsApp</h3><p><span class="tag s-agendado">● Aguardando leitura do QR Code</span></p><div class="qrbox">${w.qr ? `<img src="${w.qr}" alt="QR Code do WhatsApp" width="240" height="240">` : '<div class="loading">Gerando QR Code…</div>'}</div>
+    <ol class="kv" style="padding-left:18px;line-height:1.7"><li>No celular da clínica, abra o <b>WhatsApp</b>.</li><li>Toque em <b>Aparelhos conectados</b> › <b>Conectar um aparelho</b>.</li><li>Aponte a câmera para este código. Ele se renova sozinho.</li></ol><div class="acts"><button class="btn" onclick="disconnectWa()">Cancelar</button></div>`;
+  if (w.status === 'starting') return `<h3>Conexão do WhatsApp</h3><p><span class="tag s-atendimento">● Conectando…</span></p><p class="kv">Isso pode levar até 1 minuto. Não feche esta tela.</p>`;
+  return `<h3>Conexão do WhatsApp</h3><p><span class="tag s-cancelado" style="text-decoration:none">● ${w.status === 'error' ? 'Erro na conexão' : 'Desconectado'}</span></p>
+    ${w.error ? `<p class="kv" style="color:#c0392b">${esc(w.error)}</p>` : ''}<p class="kv">Conecte o WhatsApp da clínica lendo um QR Code. Você só precisa fazer isso uma vez.</p><button class="btn pri" onclick="connectWa()">Conectar WhatsApp</button>`;
+}
+const stPill = s => `<span class="pill ${{ enviado: 'ok', recebido: 'ok', falhou: 'bad', 'na fila': 'wait' }[s] || ''}">${esc(s)}</span>`;
+function logHtml() {
+  return `<h3>Mensagens</h3>${S.log.length ? `<table><tr><th>Quando</th><th>Tipo</th><th>Para</th><th>Mensagem</th></tr>${S.log.slice(0, 15).map(l => `<tr><td>${fmtDT(l.t)}</td><td>${esc(l.kind)}<br>${stPill(l.status)}${l.detail ? `<br><small class="kv" style="color:#c0392b">${esc(l.detail)}</small>` : ''}</td><td>${esc(l.name)}<br><small class="kv">${esc(l.to)}</small></td><td><div class="wa">${esc(l.text)}</div></td></tr>`).join('')}</table>` : '<div class="empty">Nenhuma mensagem ainda. Abra um agendamento e clique em “Enviar confirmação”.</div>'}`;
+}
+function paintWa() { const a = $('#waconn'), b = $('#walog'); if (a) a.innerHTML = connHtml(); if (b) b.innerHTML = logHtml(); }
+async function pollWa() {
+  if (!S || !isStaff() || waDemo()) return;
+  const d = await api('GET', '/api/whatsapp/status');
+  Object.assign(S.wa, { mode: d.mode, status: d.status, qr: d.qr, number: d.number, error: d.error, queued: d.queued });
+  S.log = d.log;
+  let changed = false;
+  d.log.forEach(l => { if (l.status === 'enviado' && l.appt && l.kind !== 'Lembrete') { const a = apt(l.appt); if (a && !a.wa) { a.wa = true; changed = true; } } });
+  if (ui.page === 'whatsapp') paintWa();
+  else if (changed && ['agenda', 'hoje'].includes(ui.page) && !$('#ov').classList.contains('on')) render();
+}
+// enquanto a tela do WhatsApp está aberta (ou há mensagens na fila), consulta o servidor a cada 3 s
+setInterval(() => {
+  if (!S || document.hidden || !isStaff() || waDemo()) return;
+  if (ui.page === 'whatsapp' || S.log.some(l => l.status === 'na fila')) pollWa().catch(() => {});
+}, 3000);
 function pgWa() {
-  const w = S.wa, t = w.tpl;
-  $('#view').innerHTML = `${warnHtml()}<div class="sim"><b>Modo de demonstração:</b> por enquanto o sistema <b>registra</b> as mensagens, mas ainda não as envia pelo WhatsApp. A conexão real por QR Code entra na próxima etapa.</div><div class="g2">
-  <div class="card"><h3>Conexão do WhatsApp</h3>
-   ${w.connected ? `<p><span class="tag s-concluido">● Conectado (simulação)</span></p><p class="kv">Na versão final, as mensagens saem do número da clínica, direto pelo sistema.</p><button class="btn red" onclick="S.wa.connected=false;saveSim(false);render()">Desconectar</button>`
-    : `<p><span class="tag s-cancelado" style="text-decoration:none">● Desconectado</span></p><p class="kv">Na versão final, aqui aparece o QR Code para ler no WhatsApp da clínica (Aparelhos conectados › Conectar um aparelho).</p>
-   <button class="btn pri" onclick="S.wa.connected=true;saveSim(true);render();toast('Modo de demonstração ativado')">Ativar modo de demonstração</button>`}
-   <div style="margin-top:18px"><button class="btn" onclick="sendAllConf()">💬 Registrar confirmações pendentes</button></div></div>
+  const t = S.wa.tpl;
+  $('#view').innerHTML = `${warnHtml()}${waDemo() ? '<div class="sim"><b>Modo de demonstração:</b> este servidor não tem a conexão real com o WhatsApp. As mensagens são apenas registradas.</div>' : ''}<div class="g2">
+  <div class="card" id="waconn">${connHtml()}</div>
   <div class="card"><h3>Mensagens automáticas</h3>
    <label style="margin-top:0">Confirmação de agendamento</label><textarea rows="4" onchange="S.wa.tpl.conf=this.value;saveTpl()">${esc(t.conf)}</textarea>
    <label>Lembrete (véspera)</label><textarea rows="2" onchange="S.wa.tpl.lemb=this.value;saveTpl()">${esc(t.lemb)}</textarea>
    <label>Agenda do dia para a profissional</label><textarea rows="3" onchange="S.wa.tpl.agenda=this.value;saveTpl()">${esc(t.agenda)}</textarea>
-   <p class="kv">Variáveis: {nome} {procedimento} {data} {hora} {profissional} {clinica} {lista}</p></div></div>
-  <div class="card" style="margin-top:16px"><h3>Mensagens registradas</h3>${S.log.length ? `<table><tr><th>Quando</th><th>Tipo</th><th>Para</th><th>Mensagem</th></tr>${S.log.slice(0, 15).map(l => `<tr><td>${fmtDT(l.t)}</td><td>${esc(l.kind)}<br><span class="pill">${esc(l.status)}</span></td><td>${esc(l.name)}<br><small class="kv">${esc(l.to)}</small></td><td><div class="wa">${esc(l.text)}</div></td></tr>`).join('')}</table>` : '<div class="empty">Nenhuma mensagem registrada ainda. Abra um agendamento e clique em “Enviar confirmação”.</div>'}</div>`;
+   <p class="kv">Variáveis: {nome} {procedimento} {data} {hora} {profissional} {clinica} {lista}</p>
+   <p class="kv">Quando o cliente responde <b>1</b>, o agendamento passa a “Confirmado” sozinho. Se responde <b>2</b>, aparece nas mensagens para a recepção remarcar.</p></div></div>
+  <div class="card" style="margin-top:16px" id="walog">${logHtml()}</div>`;
+  if (!waDemo()) pollWa().catch(() => {});
 }
 
 /* ---------- atendimento do dia (visão da profissional) ---------- */
@@ -446,13 +523,28 @@ async function saveCli(id) {
 async function fichaCli(id) {
   const c = cli(id);
   modal(`<h2>${esc(c.name)}</h2><p class="kv">📞 ${esc(c.phone)}</p>${c.notes ? `<p class="kv">📝 ${esc(c.notes)}</p>` : ''}
-  <h3 style="margin-top:16px">Histórico</h3><div id="hist" class="loading">Carregando…</div>
-  <div class="acts">${isStaff() ? `<button class="btn pri" onclick="formAppt(null,{client:'${id}'})">+ Agendar</button><button class="btn" onclick="formCli('${id}')">Editar</button>` : ''}<button class="btn" onclick="closeM()">Fechar</button></div>`, true);
+  ${isStaff() ? `<h3 style="margin-top:16px">Pacotes e compras</h3><div id="sales" class="loading">Carregando…</div>` : ''}
+  <h3 style="margin-top:16px">Histórico de atendimentos</h3><div id="hist" class="loading">Carregando…</div>
+  <div class="acts">${isStaff() ? `<button class="btn pri" onclick="formAppt(null,{client:'${id}'})">+ Agendar</button><button class="btn grn" onclick="formSale('${id}')">💰 Lançar venda</button><button class="btn" onclick="formCli('${id}')">Editar</button>` : ''}<button class="btn" onclick="closeM()">Fechar</button></div>`, true);
+  if (isStaff()) loadCliSales(id);
   const r = await run(() => api('GET', `/api/clients/${id}/history`));
   const box = $('#hist'); if (!box) return;
   if (!r) { box.textContent = 'Não foi possível carregar o histórico.'; return; }
   box.className = '';
-  box.innerHTML = r.appts.length ? r.appts.map(a => `<div class="pl-row" style="padding:9px 0"><div style="width:62px">${shortD(a.date)}<br><small class="kv">${a.time}</small></div><div style="flex:1">${esc(prc(a.proc).name)}<div class="kv">${esc(pro(a.pro).name)}</div></div><span class="tag s-${a.status}">${STAT[a.status]}</span>${a.hasPhoto ? '<span title="Tem foto">📷</span>' : ''}${a.hasSign ? '<span title="Tem assinatura">✍️</span>' : ''}</div>`).join('') : '<div class="empty">Sem atendimentos ainda.</div>';
+  box.innerHTML = r.appts.length ? r.appts.map(a => `<div class="pl-row" style="padding:9px 0"><div style="width:62px">${shortD(a.date)}<br><small class="kv">${a.time}</small></div><div style="flex:1">${esc(prc(a.proc).name)}<div class="kv">${esc(pro(a.pro).name)}</div></div><span class="tag s-${a.status}">${STAT[a.status]}</span>${a.paid ? '<span title="Paga">💰</span>' : ''}${a.saleId ? '<span title="Sessão de pacote">📦</span>' : ''}${a.hasPhoto ? '<span title="Tem foto">📷</span>' : ''}${a.hasSign ? '<span title="Tem assinatura">✍️</span>' : ''}</div>`).join('') : '<div class="empty">Sem atendimentos ainda.</div>';
+}
+
+async function loadCliSales(id) {
+  const r = await run(() => api('GET', `/api/sales?clientId=${id}`));
+  const box = $('#sales'); if (!box) return;
+  if (!r) { box.textContent = 'Não foi possível carregar as compras.'; return; }
+  box.className = ''; keepSales(r.sales);
+  box.innerHTML = r.sales.length ? r.sales.map(s => {
+    const st = pkgState(s), pct = s.kind === 'package' ? Math.min(100, Math.round(s.used / s.sessions * 100)) : 100;
+    return `<div class="pk ${s.status !== 'ativa' ? 'canc' : ''}" onclick="showSale('${s.id}')"><div class="pk-h"><b>${s.kind === 'package' ? '📦' : '✨'} ${esc(s.name)}</b><span class="pill ${st[1]}">${s.kind === 'package' ? st[0] : (s.status === 'ativa' ? 'Paga' : 'Cancelada')}</span></div>
+      <div class="kv">Pago em ${fmtDate(s.date)} · ${brl(s.total)} · ${esc(paysTxt(s))}</div>
+      ${s.kind === 'package' ? `<div class="prog"><i style="width:${pct}%"></i></div><div class="kv"><b>${s.used} de ${s.sessions}</b> sessões feitas${s.scheduled ? ' · ' + s.scheduled + ' agendada' + (s.scheduled > 1 ? 's' : '') : ''}${s.validUntil ? ' · período até ' + fmtDate(s.validUntil) : ''}</div>` : ''}</div>`;
+  }).join('') : '<div class="empty">Nenhuma compra registrada.</div>';
 }
 
 /* ---------- importar / exportar clientes ---------- */
@@ -698,6 +790,146 @@ async function doIA() {
   toast(r.created + ' agendamentos importados' + (r.newClients ? ' · ' + r.newClients + ' clientes novos' : '') + (r.newProcedures ? ' · ' + r.newProcedures + ' procedimentos criados' : '') + (r.skipped ? ' · ' + r.skipped + ' ignorados' : ''));
 }
 
+/* ---------- vendas, pacotes e desempenho ---------- */
+const METH = { pix: 'Pix', credito: 'Crédito', debito: 'Débito', dinheiro: 'Dinheiro', transferencia: 'Transferência', outro: 'Outro' };
+const payTxt = p => p.method === 'credito' ? (p.installments > 1 ? `Crédito ${p.installments}x de ${brl(p.amount / p.installments)}` : 'Crédito à vista') : METH[p.method];
+const paysTxt = s => s.payments.map(p => payTxt(p) + (s.payments.length > 1 ? ' (' + brl(p.amount) + ')' : '')).join(' + ');
+const fmtDate = s => s ? s.split('-').reverse().join('/') : '';
+const monthName = m => { const t = new Date(m + '-01T12:00').toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' }); return t.charAt(0).toUpperCase() + t.slice(1); };
+const money = v => {
+  let s = String(v ?? '').replace(/[^\d,.-]/g, '');
+  if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+  else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+  const n = parseFloat(s); return isFinite(n) ? n : 0;
+};
+const fmtIn = n => n.toFixed(2).replace('.', ',');
+const saleCache = {};
+const keepSales = l => { l.forEach(x => { saleCache[x.id] = x; }); return l; };
+const pkgState = p => p.status !== 'ativa' ? ['Cancelado', 'off'] : p.used >= p.sessions ? ['Concluído', 'off'] : (p.validUntil && p.validUntil < TODAY) ? ['Vencido', 'bad'] : ['Ativo', 'ok'];
+const pkgLeft = p => p.sessions - p.used - p.scheduled;
+
+let sl = null;
+function formSale(clientId, apptId) {
+  const a = apptId ? apt(apptId) : null;
+  const cid = clientId || (a && a.client) || '';
+  const d = new Date(); d.setDate(d.getDate() + 180);
+  sl = { kind: 'package', lines: [{ method: 'pix', amount: '', inst: 1 }], apptId: apptId || '' };
+  modal(`<h2>Lançar venda</h2>
+  ${a ? `<p class="kv">Referente ao atendimento de ${shortD(a.date)} às ${a.time} (${esc(prc(a.proc).name)}). Ele ficará com a etiqueta <b>Paga</b>.</p>` : ''}
+  <label>Cliente</label>${cid ? `<input type="text" value="${esc(cli(cid).name)}" disabled><input type="hidden" id="s_c" value="${cid}">` : `<select id="s_c"><option value="">Selecione…</option>${S.clients.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select>`}
+  <label>O que foi vendido</label>
+  <div class="seg"><button id="sk1" class="on" onclick="slKind('package')">📦 Pacote de sessões</button><button id="sk2" onclick="slKind('procedure')">✨ Procedimento avulso</button></div>
+  <label>Nome</label><input type="text" id="s_n" list="s_dl" maxlength="140" placeholder="Ex.: Pacote Laser axila 6 sessões">
+  <datalist id="s_dl">${activeProcs().map(p => `<option value="${esc(p.name)}">`).join('')}</datalist>
+  <div class="row" id="s_pk"><div><label>Quantidade de sessões</label><input type="text" id="s_s" value="6" inputmode="numeric"></div><div><label>Validade do pacote</label><input type="date" id="s_v" value="${iso(d)}"></div></div>
+  <label>Valor total (R$)</label><input type="text" id="s_t" inputmode="decimal" placeholder="0,00" oninput="slTotal()">
+  <label>Forma de pagamento</label><div id="s_lines"></div><div id="s_rest" class="kv" style="margin:6px 0"></div>
+  <button class="btn sm" onclick="slAdd()">+ Dividir em outra forma de pagamento</button>
+  ${a ? `<label class="chk" id="s_uw"><input type="checkbox" id="s_u"> Este atendimento já conta como 1 sessão do pacote</label>` : ''}
+  <label>Observação (opcional)</label><input type="text" id="s_o" maxlength="300">
+  <div class="acts"><button class="btn pri" id="s_save" onclick="saveSale()">Salvar venda</button><button class="btn" onclick="closeM()">Cancelar</button></div>`, true);
+  slLines();
+}
+function slKind(k) {
+  sl.kind = k; $('#sk1').classList.toggle('on', k === 'package'); $('#sk2').classList.toggle('on', k === 'procedure');
+  $('#s_pk').style.display = k === 'package' ? '' : 'none'; const u = $('#s_uw'); if (u) u.style.display = k === 'package' ? '' : 'none';
+  $('#s_n').placeholder = k === 'package' ? 'Ex.: Pacote Laser axila 6 sessões' : 'Ex.: Limpeza de pele';
+}
+function slTotal() { if (sl.lines.length === 1) { sl.lines[0].amount = $('#s_t').value; const i = document.querySelector('#s_lines input'); if (i) i.value = sl.lines[0].amount; } slRest(); }
+function slSum() { return sl.lines.reduce((s, l) => s + money(l.amount), 0); }
+function slRest() {
+  const el = $('#s_rest'); if (!el) return;
+  const diff = Math.round((money($('#s_t').value) - slSum()) * 100);
+  el.innerHTML = !money($('#s_t').value) ? '' : diff === 0 ? '<span style="color:#0F5F2A">✔ Pagamento confere com o total</span>' : diff > 0 ? `<span style="color:#a05a00">Falta lançar ${brl(diff / 100)}</span>` : `<span style="color:#a32a20">Passou do total em ${brl(-diff / 100)}</span>`;
+}
+function slLines() {
+  $('#s_lines').innerHTML = sl.lines.map((l, i) => `<div class="row sl-l"><select onchange="sl.lines[${i}].method=this.value;sl.lines[${i}].inst=1;slLines()">${Object.entries(METH).map(([k, v]) => `<option value="${k}" ${l.method === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+   <input type="text" inputmode="decimal" placeholder="Valor" value="${esc(l.amount)}" oninput="sl.lines[${i}].amount=this.value;slRest()">
+   ${l.method === 'credito' ? `<select onchange="sl.lines[${i}].inst=+this.value;slRest()">${Array.from({ length: 12 }, (_, k) => `<option value="${k + 1}" ${l.inst == k + 1 ? 'selected' : ''}>${k ? (k + 1) + 'x' : 'À vista'}</option>`).join('')}</select>` : ''}
+   ${sl.lines.length > 1 ? `<button class="btn sm red" style="flex:0" onclick="sl.lines.splice(${i},1);slLines()">✕</button>` : ''}</div>`).join('');
+  slRest();
+}
+function slAdd() {
+  const rest = money($('#s_t').value) - slSum();
+  if (sl.lines.length >= 6) return toast('Máximo de 6 formas de pagamento');
+  sl.lines.push({ method: 'pix', amount: rest > 0 ? fmtIn(rest) : '', inst: 1 }); slLines();
+}
+async function saveSale() {
+  const cid = $('#s_c').value; if (!cid) return toast('Selecione o cliente');
+  const name = $('#s_n').value.trim(); if (!name) return toast('Informe o nome do pacote ou procedimento');
+  const total = money($('#s_t').value); if (!(total > 0)) return toast('Informe o valor total');
+  const pays = sl.lines.map(l => ({ method: l.method, amount: money(l.amount), installments: l.method === 'credito' ? l.inst : 1 }));
+  if (pays.some(p => !(p.amount > 0))) return toast('Informe o valor de cada forma de pagamento');
+  if (Math.round(pays.reduce((s, p) => s + p.amount, 0) * 100) !== Math.round(total * 100)) return toast('A soma dos pagamentos precisa ser igual ao valor total');
+  const sessions = sl.kind === 'package' ? parseInt($('#s_s').value) || 0 : 1;
+  if (sl.kind === 'package' && !(sessions >= 1)) return toast('Informe a quantidade de sessões');
+  const proc = S.procs.find(p => p.name.toLowerCase() === name.toLowerCase());
+  const body = { clientId: cid, appointmentId: sl.apptId || null, kind: sl.kind, name, procedureId: proc ? proc.id : null, total, sessions,
+    validUntil: sl.kind === 'package' ? ($('#s_v').value || null) : null, payments: pays, note: $('#s_o').value,
+    useAppointment: sl.kind === 'package' && !!($('#s_u') && $('#s_u').checked) };
+  const b = $('#s_save'); b.disabled = true;
+  const r = await run(() => api('POST', '/api/sales', body));
+  if (!r) { b.disabled = false; return; }
+  keepSales([r]);
+  await run(reload);
+  closeM(); render(); toast('Venda lançada ✔');
+}
+
+async function pgVendas() {
+  if (!isStaff()) return;
+  if (!ui.vm) ui.vm = TODAY.slice(0, 7);
+  const m = ui.vm;
+  $('#view').innerHTML = warnHtml() + '<div class="loading">Carregando…</div>';
+  const r = await run(async () => { const [st, ls] = await Promise.all([api('GET', '/api/sales/stats?month=' + m), api('GET', '/api/sales?month=' + m)]); return { st, ls: keepSales(ls.sales) }; });
+  if (ui.page !== 'vendas') return;
+  if (!r) { $('#view').innerHTML = warnHtml() + '<div class="card empty">Não foi possível carregar as vendas.</div>'; return; }
+  const { st, ls } = r;
+  const delta = (cur, prev) => prev > 0 ? (() => { const p = (cur - prev) / prev * 100; return `<small class="${p >= 0 ? 'up' : 'dn'}">${p >= 0 ? '▲' : '▼'} ${Math.abs(p).toFixed(0)}% vs mês anterior</small>`; })() : '<small>sem mês anterior para comparar</small>';
+  const max = Math.max(1, ...st.top.map(t => t.qty)), totM = st.methods.reduce((s, x) => s + x.amount, 0) || 1;
+  $('#view').innerHTML = `${warnHtml()}<div class="bar"><button class="btn" onclick="vmShift(-1)">‹</button><div class="dt">${monthName(m)}</div><button class="btn" onclick="vmShift(1)">›</button><button class="btn" onclick="ui.vm=TODAY.slice(0,7);pgVendas()">Este mês</button><div class="sp"></div><button class="btn pri" onclick="formSale()">+ Lançar venda</button></div>
+  <div class="kpis"><div class="kpi"><span>Faturamento</span><b>${brl(st.revenue)}</b>${delta(st.revenue, st.previous.revenue)}</div>
+   <div class="kpi"><span>Vendas no mês</span><b>${st.count}</b>${delta(st.count, st.previous.count)}</div>
+   <div class="kpi"><span>Ticket médio</span><b>${brl(st.ticket)}</b>${delta(st.ticket, st.previous.ticket)}</div></div>
+  <div class="g2"><div class="card"><h3>Mais vendidos do mês</h3>${st.top.length ? st.top.map((t, i) => `<div class="hb-r"><div class="hb-t"><b>${i + 1}. ${esc(t.name)}</b><span>${t.qty} ${t.qty === 1 ? 'venda' : 'vendas'} · ${brl(t.revenue)}</span></div><div class="hb"><i style="width:${t.qty / max * 100}%"></i></div></div>`).join('') : '<div class="empty">Nenhuma venda neste mês.</div>'}</div>
+  <div class="card"><h3>Como os clientes pagaram</h3>${st.methods.length ? st.methods.map(x => `<div class="hb-r"><div class="hb-t"><b>${METH[x.method]}</b><span>${brl(x.amount)} · ${(x.amount / totM * 100).toFixed(0)}%</span></div><div class="hb"><i style="width:${x.amount / totM * 100}%"></i></div></div>`).join('') : '<div class="empty">Nenhum pagamento neste mês.</div>'}
+  <p class="kv" style="margin-top:12px">Ticket médio = faturamento ÷ número de vendas. Vendas canceladas não entram.</p></div></div>
+  <div class="card" style="margin-top:16px"><h3>Vendas de ${monthName(m).toLowerCase()}</h3>${ls.length ? `<table><tr><th>Data</th><th>Cliente</th><th>Item</th><th>Pagamento</th><th style="text-align:right">Valor</th></tr>${ls.map(s => `<tr class="cl ${s.status !== 'ativa' ? 'canc' : ''}" onclick="showSale('${s.id}')"><td>${fmtDate(s.date)}</td><td><b>${esc(s.clientName)}</b></td><td>${s.kind === 'package' ? '📦 ' : ''}${esc(s.name)}${s.status !== 'ativa' ? ' <span class="pill off">cancelada</span>' : ''}</td><td>${esc(paysTxt(s))}</td><td style="text-align:right"><b>${brl(s.total)}</b></td></tr>`).join('')}</table>` : '<div class="empty">Nenhuma venda lançada neste mês. Abra um atendimento na agenda e clique em “Lançar venda”.</div>'}</div>`;
+}
+function vmShift(n) { const d = new Date(ui.vm + '-01T12:00'); d.setMonth(d.getMonth() + n); ui.vm = iso(d).slice(0, 7); pgVendas(); }
+
+function showSale(id) {
+  const s = saleCache[id]; if (!s) return;
+  const stt = pkgState(s);
+  modal(`<h2>${esc(s.name)}</h2><span class="tag ${s.status === 'ativa' ? 's-concluido' : 's-cancelado'}">${s.status === 'ativa' ? '💰 Paga' : 'Cancelada'}</span>
+  <p class="kv">👤 ${esc(s.clientName)}</p><p class="kv">📅 Pago em ${fmtDate(s.date)}</p><p class="kv">💰 ${brl(s.total)} · ${esc(paysTxt(s))}</p>
+  ${s.kind === 'package' ? `<p class="kv">📦 ${s.used} feita${s.used === 1 ? '' : 's'} · ${s.scheduled} agendada${s.scheduled === 1 ? '' : 's'} · ${s.sessions} no total${s.validUntil ? ' · vale até ' + fmtDate(s.validUntil) : ''} <span class="pill ${stt[1]}">${stt[0]}</span></p>` : ''}
+  ${s.note ? `<p class="kv">📝 ${esc(s.note)}</p>` : ''}
+  ${s.kind === 'package' && s.status === 'ativa' ? `<label>Validade do pacote</label><div class="row" style="align-items:center"><input type="date" id="sv_v" value="${s.validUntil || ''}"><button class="btn" style="flex:0;white-space:nowrap" onclick="saveValidity('${id}')">Salvar validade</button></div>` : ''}
+  <div class="acts"><button class="btn" onclick="fichaCli('${s.client}')">Ficha do cliente</button>${isAdmin() && s.status === 'ativa' ? `<button class="btn red" onclick="cancelSale('${id}')">Cancelar venda</button>` : ''}<button class="btn" onclick="closeM()">Fechar</button></div>`);
+}
+async function saveValidity(id) {
+  const r = await run(() => api('PATCH', '/api/sales/' + id, { validUntil: $('#sv_v').value || null }));
+  if (r) { keepSales([r]); await run(reload); toast('Validade atualizada'); showSale(id); }
+}
+async function cancelSale(id) {
+  if (!confirm('Cancelar esta venda? Ela deixa de contar no faturamento e a etiqueta “Paga” sai do atendimento.')) return;
+  const r = await run(() => api('PATCH', '/api/sales/' + id, { status: 'cancelada' }));
+  if (!r) return; keepSales([r]); await run(reload); closeM(); render(); toast('Venda cancelada');
+}
+
+// vincular um atendimento a uma sessão de pacote
+function usePkg(id) {
+  const a = apt(id), l = S.pkgs.filter(p => p.client === a.client && pkgLeft(p) > 0 && (!p.validUntil || a.date <= p.validUntil));
+  if (!l.length) return toast('Esse cliente não tem pacote com sessões disponíveis nessa data');
+  modal(`<h2>Usar sessão de pacote</h2><p class="kv">${esc(cli(a.client).name)} · ${shortD(a.date)} às ${a.time}</p><label>Pacote</label>
+  <select id="u_p">${l.map(p => `<option value="${p.id}">${esc(p.name)} (${p.used + p.scheduled} de ${p.sessions} usadas/agendadas)</option>`).join('')}</select>
+  <div class="acts"><button class="btn pri" onclick="saveUsePkg('${id}',document.getElementById('u_p').value)">Vincular</button><button class="btn" onclick="showAppt('${id}')">Voltar</button></div>`);
+}
+async function saveUsePkg(id, saleId) {
+  const r = await run(() => api('PATCH', '/api/appointments/' + id, { saleId }));
+  if (!r) return; await run(reload); closeM(); render(); toast(saleId ? 'Sessão vinculada ao pacote' : 'Pacote desvinculado');
+}
+
 /* ---------- equipe e cadastros ---------- */
 async function pgEquipe() {
   $('#view').innerHTML = warnHtml() + '<div class="loading">Carregando…</div>';
@@ -710,6 +942,7 @@ async function pgEquipe() {
   const teamHtml = team ? `<div class="card"><h3>Equipe</h3>
     ${team.team.map(m => `<div class="trow"><input type="color" value="${m.color}" ${m.role === 'professional' ? '' : 'disabled'} onchange="patchMember('${m.id}',{color:this.value})" title="Cor na agenda">
       <div class="nm"><input type="text" value="${esc(m.name)}" onchange="patchMember('${m.id}',{name:this.value})"><small>${esc(m.email)}</small></div>
+      ${m.role === 'professional' ? `<input type="tel" class="ph" placeholder="WhatsApp (agenda do dia)" value="${esc(m.phone || '')}" onchange="patchMember('${m.id}',{phone:this.value})">` : ''}
       <span class="pill ${m.active ? 'ok' : 'off'}">${ROLE[m.role]}${m.active ? '' : ' · inativa'}</span>
       ${m.role !== 'admin' ? `<button class="btn sm" onclick="newPw('${m.id}')">Nova senha</button><button class="btn sm ${m.active ? 'red' : ''}" onclick="patchMember('${m.id}',{active:${!m.active}})">${m.active ? 'Desativar' : 'Reativar'}</button>` : ''}</div>`).join('')}
     <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap"><button class="btn pri" ${us.professional >= lim.professionals ? 'disabled' : ''} onclick="formTeam('professional')">+ Profissional</button><button class="btn" ${us.receptionist >= lim.receptionists ? 'disabled' : ''} onclick="formTeam('receptionist')">+ Recepcionista</button></div>
@@ -722,11 +955,11 @@ async function pgEquipe() {
 }
 function formTeam(role) {
   modal(`<h2>${role === 'professional' ? 'Nova profissional' : 'Nova recepcionista'}</h2><p class="kv">Ela entra no sistema com este e-mail e senha.</p>
-  <label>Nome</label><input type="text" id="t_n"><label>E-mail</label><input type="text" id="t_e" inputmode="email" autocomplete="off"><label>Senha inicial (mínimo 8 caracteres)</label><input type="text" id="t_p" autocomplete="off">
+  <label>Nome</label><input type="text" id="t_n">${role === 'professional' ? '<label>WhatsApp (para receber a agenda do dia)</label><input type="tel" id="t_ph" placeholder="(82) 90000-0000">' : ''}<label>E-mail</label><input type="text" id="t_e" inputmode="email" autocomplete="off"><label>Senha inicial (mínimo 8 caracteres)</label><input type="text" id="t_p" autocomplete="off">
   <div class="acts"><button class="btn pri" onclick="saveTeam('${role}')">Cadastrar</button><button class="btn" onclick="closeM()">Cancelar</button></div>`);
 }
 async function saveTeam(role) {
-  const r = await run(() => api('POST', '/api/team', { role, name: $('#t_n').value, email: $('#t_e').value, password: $('#t_p').value }));
+  const r = await run(() => api('POST', '/api/team', { role, name: $('#t_n').value, email: $('#t_e').value, password: $('#t_p').value, phone: $('#t_ph') ? $('#t_ph').value : '' }));
   if (!r) return; closeM(); await run(reload); pgEquipe(); toast('Cadastrada. Passe o e-mail e a senha para ela entrar.');
 }
 async function patchMember(id, body) {

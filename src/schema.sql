@@ -90,3 +90,45 @@ CREATE TABLE IF NOT EXISTS message_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS msglog_idx ON message_log (clinic_id, created_at DESC);
+
+-- WhatsApp real: sessão por clínica e detalhes do envio
+ALTER TABLE clinics ADD COLUMN IF NOT EXISTS wa_autostart BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_log ADD COLUMN IF NOT EXISTS detail TEXT NOT NULL DEFAULT '';
+ALTER TABLE message_log ADD COLUMN IF NOT EXISTS appointment_id BIGINT;
+CREATE INDEX IF NOT EXISTS msglog_appt_idx ON message_log (clinic_id, appointment_id);
+
+-- Vendas: pacotes e procedimentos pagos
+CREATE TABLE IF NOT EXISTS sales (
+  id BIGSERIAL PRIMARY KEY,
+  clinic_id BIGINT NOT NULL REFERENCES clinics(id) ON DELETE CASCADE,
+  client_id BIGINT NOT NULL REFERENCES clients(id),
+  appointment_id BIGINT REFERENCES appointments(id) ON DELETE SET NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('package','procedure')),
+  name TEXT NOT NULL,
+  procedure_id BIGINT REFERENCES procedures(id) ON DELETE SET NULL,
+  total NUMERIC(12,2) NOT NULL CHECK (total > 0),
+  sessions INT NOT NULL DEFAULT 1 CHECK (sessions BETWEEN 1 AND 200),
+  valid_until DATE,
+  sale_date DATE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ativa' CHECK (status IN ('ativa','cancelada')),
+  note TEXT NOT NULL DEFAULT '',
+  created_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS sales_clinic_date_idx ON sales (clinic_id, sale_date);
+CREATE INDEX IF NOT EXISTS sales_client_idx ON sales (clinic_id, client_id);
+CREATE INDEX IF NOT EXISTS sales_appt_idx ON sales (appointment_id);
+
+CREATE TABLE IF NOT EXISTS sale_payments (
+  id BIGSERIAL PRIMARY KEY,
+  sale_id BIGINT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  method TEXT NOT NULL CHECK (method IN ('pix','credito','debito','dinheiro','transferencia','outro')),
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  installments INT NOT NULL DEFAULT 1 CHECK (installments BETWEEN 1 AND 24)
+);
+CREATE INDEX IF NOT EXISTS sale_payments_idx ON sale_payments (sale_id);
+
+-- Sessão de pacote consumida por um agendamento
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sale_id BIGINT REFERENCES sales(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS appts_sale_idx ON appointments (sale_id);

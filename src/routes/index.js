@@ -28,6 +28,7 @@ api.use('/clients', require('./clients'));
 api.use('/procedures', require('./procedures'));
 api.use('/appointments', require('./appointments'));
 api.use('/blocks', require('./blocks'));
+api.use('/sales', require('./sales'));
 api.use('/', require('./misc'));
 
 api.use((req, res) => res.status(404).json({ error: 'Rota não encontrada' }));

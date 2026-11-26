@@ -59,6 +59,19 @@ async function checkSlot(db, clinicId, b, ignoreId) {
   return { clientId: b.clientId, procedureId: b.procedureId, professionalId: b.professionalId, date: b.date, start, dur };
 }
 
+/** Confere se o agendamento pode consumir uma sessão do pacote informado. */
+async function checkSale(clinicId, clientId, saleId, date, ignoreApptId) {
+  if (saleId === undefined || saleId === null || saleId === '') return null;
+  if (!isId(saleId)) throw bad('Pacote inválido');
+  const s = (await q('SELECT id, client_id, kind, status, sessions, valid_until FROM sales WHERE id=$1 AND clinic_id=$2', [saleId, clinicId])).rows[0];
+  if (!s || s.status !== 'ativa' || s.kind !== 'package') throw bad('Pacote não encontrado');
+  if (String(s.client_id) !== String(clientId)) throw bad('Esse pacote é de outro cliente');
+  if (s.valid_until && date > s.valid_until) throw conflict('O pacote vence em ' + s.valid_until.split('-').reverse().join('/') + ', antes da data do agendamento. Ajuste a validade na ficha do cliente.', 'pkg_expired');
+  const used = (await q(`SELECT count(*)::int AS n FROM appointments WHERE sale_id=$1 AND status<>'cancelado' AND id<>COALESCE($2,0)`, [s.id, ignoreApptId || null])).rows[0].n;
+  if (used >= s.sessions) throw conflict('Esse pacote não tem mais sessões disponíveis', 'pkg_full');
+  return s.id;
+}
+
 // Lista por período
 r.get('/', wrap(async (req, res) => {
   const { from, to } = req.query;
@@ -73,10 +86,11 @@ r.get('/', wrap(async (req, res) => {
 
 r.post('/', staff, wrap(async (req, res) => {
   const v = await checkSlot({ query: (t, p) => q(t, p) }, req.user.clinicId, req.body, null);
+  const saleId = await checkSale(req.user.clinicId, v.clientId, req.body.saleId, v.date, null);
   const row = (await q(
-    `INSERT INTO appointments (clinic_id, client_id, professional_id, procedure_id, date, start_min, duration, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *, false AS has_sign, false AS has_photo`,
-    [req.user.clinicId, v.clientId, v.professionalId, v.procedureId, v.date, v.start, v.dur, req.user.id])).rows[0];
+    `INSERT INTO appointments (clinic_id, client_id, professional_id, procedure_id, date, start_min, duration, created_by, sale_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *, false AS has_sign, false AS has_photo, false AS paid`,
+    [req.user.clinicId, v.clientId, v.professionalId, v.procedureId, v.date, v.start, v.dur, req.user.id, saleId])).rows[0];
   res.status(201).json(S.appt(row));
 }));
 
@@ -90,12 +104,17 @@ r.patch('/:id', staff, wrap(async (req, res) => {
     time: b.time ?? `${Math.floor(cur.start_min / 60)}:${String(cur.start_min % 60).padStart(2, '0')}`,
     dur: b.dur ?? cur.duration, allowOverlap: b.allowOverlap
   }, cur.id);
+  const clientChanged = String(v.clientId) !== String(cur.client_id);
+  const saleId = (b.saleId === undefined && !clientChanged)
+    ? cur.sale_id                                                   // não mexeu no pacote: mantém como está
+    : await checkSale(req.user.clinicId, v.clientId, clientChanged && b.saleId === undefined ? null : b.saleId, v.date, cur.id);
   const moved = v.date !== cur.date || v.start !== cur.start_min || String(v.professionalId) !== String(cur.professional_id);
   const row = (await q(
     `UPDATE appointments SET client_id=$3, professional_id=$4, procedure_id=$5, date=$6, start_min=$7, duration=$8,
-            status = CASE WHEN $9 THEN 'agendado' ELSE status END, wa_sent = CASE WHEN $9 THEN false ELSE wa_sent END
-      WHERE id=$1 AND clinic_id=$2 RETURNING *, (sign_image IS NOT NULL) AS has_sign, (photo_image IS NOT NULL) AS has_photo`,
-    [cur.id, req.user.clinicId, v.clientId, v.professionalId, v.procedureId, v.date, v.start, v.dur, moved])).rows[0];
+            status = CASE WHEN $9 THEN 'agendado' ELSE status END, wa_sent = CASE WHEN $9 THEN false ELSE wa_sent END, sale_id=$10
+      WHERE id=$1 AND clinic_id=$2 RETURNING *, (sign_image IS NOT NULL) AS has_sign, (photo_image IS NOT NULL) AS has_photo,
+        EXISTS (SELECT 1 FROM sales s WHERE s.appointment_id=appointments.id AND s.status='ativa') AS paid`,
+    [cur.id, req.user.clinicId, v.clientId, v.professionalId, v.procedureId, v.date, v.start, v.dur, moved, saleId])).rows[0];
   res.json(S.appt(row));
 }));
 
@@ -107,7 +126,8 @@ r.post('/:id/status', wrap(async (req, res) => {
     if (String(cur.professional_id) !== req.user.id || to !== 'atendimento') throw forbidden();
   }
   const row = (await q(
-    `UPDATE appointments SET status=$3 WHERE id=$1 AND clinic_id=$2 RETURNING *, (sign_image IS NOT NULL) AS has_sign, (photo_image IS NOT NULL) AS has_photo`,
+    `UPDATE appointments SET status=$3 WHERE id=$1 AND clinic_id=$2 RETURNING *, (sign_image IS NOT NULL) AS has_sign, (photo_image IS NOT NULL) AS has_photo,
+      EXISTS (SELECT 1 FROM sales s WHERE s.appointment_id=appointments.id AND s.status='ativa') AS paid`,
     [cur.id, req.user.clinicId, to])).rows[0];
   res.json(S.appt(row));
 }));
@@ -124,7 +144,8 @@ r.post('/:id/finish', wrap(async (req, res) => {
   }
   const row = (await q(
     `UPDATE appointments SET status='concluido', done_at=now(), done_by=$3, sign_image=$4, photo_image=$5
-      WHERE id=$1 AND clinic_id=$2 RETURNING *, (sign_image IS NOT NULL) AS has_sign, (photo_image IS NOT NULL) AS has_photo`,
+      WHERE id=$1 AND clinic_id=$2 RETURNING *, (sign_image IS NOT NULL) AS has_sign, (photo_image IS NOT NULL) AS has_photo,
+      EXISTS (SELECT 1 FROM sales s WHERE s.appointment_id=appointments.id AND s.status='ativa') AS paid`,
     [cur.id, req.user.clinicId, req.user.id, sign, photo])).rows[0];
   res.json(S.appt(row));
 }));
